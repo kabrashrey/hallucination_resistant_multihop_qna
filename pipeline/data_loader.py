@@ -1,11 +1,5 @@
 """
 HotpotQA Dataset Loader
-Usage:
-    from pipeline.data_loader import HotpotQALoader
-
-    loader = HotpotQALoader("data/hotpot_dev_distractor_v1.json")
-    examples = loader.load()           # list of standardized dicts
-    index = loader.build_passage_index()  # {passage_id: {title, sentences, text}}
 """
 
 import json
@@ -342,9 +336,11 @@ def load_hotpotqa_splits(
 
 if __name__ == "__main__":
     import sys
+    from pipeline.logger import get_logger
+    log = get_logger("data_loader")
 
     if len(sys.argv) < 2:
-        print("Usage: python -m pipeline.data_loader <path_to_hotpotqa.json> [limit]")
+        log.error("Usage: python -m pipeline.data_loader <path_to_hotpotqa.json> [limit]")
         sys.exit(1)
 
     file_path = sys.argv[1]
@@ -353,59 +349,18 @@ if __name__ == "__main__":
     loader = HotpotQALoader(file_path)
     examples = loader.load(limit=limit)
 
-    print(f"\nLoaded {len(loader)} total examples from {loader.file_path.name}")
-    print(f"Showing first {limit}:\n")
+    log.success(f"Loaded {len(loader)} total examples from {loader.file_path.name}")
+    log.info(f"Showing first {limit}:")
 
     for ex in examples:
-        print(f"  ID:       {ex.id}")
-        print(f"Question: {ex.question}")
-        print(f"Answer:   {ex.answer}")
-        print(f"Type:     {ex.question_type} | Level: {ex.level}")
-        print(f"Contexts: {len(ex.contexts)} passages")
-        print(f"SP Facts: {len(ex.supporting_facts)} facts")
-        print(f"Gold:     {ex.get_gold_sentences()[:2]}...")
-        print()
+        log.info(f"  ID:       {ex.id}")
+        log.info(f"  Question: {ex.question}")
+        log.info(f"  Answer:   {ex.answer}")
+        log.info(f"  Type:     {ex.question_type} | Level: {ex.level}")
+        log.info(f"  Contexts: {len(ex.contexts)} passages")
+        log.info(f"  SP Facts: {len(ex.supporting_facts)} facts")
+        log.info(f"  Gold:     {ex.get_gold_sentences()[:2]}...")
 
-    print("---Stats---")
+    log.info("---Stats---")
     for k, v in loader.get_stats().items():
-        print(f"{k}: {v}")
-
-
-"""
-python -m pipeline.data_loader data/hotpot_dev_distractor_v1.json 3
-
-Loaded 7405 total examples from hotpot_dev_distractor_v1.json
-Showing first 3:
-
-  ID:       5a8b57f25542995d1e6f1371
-  Question: Were Scott Derrickson and Ed Wood of the same nationality?
-  Answer:   yes
-  Type:     comparison | Level: hard
-  Contexts: 10 passages
-  SP Facts: 2 facts
-  Gold:     ['Scott Derrickson (born July 16, 1966) is an American director, screenwriter and producer.', 'Edward Davis Wood Jr. (October 10, 1924 – December 10, 1978) was an American filmmaker, actor, writer, producer, and director.']...
-
-  ID:       5a8c7595554299585d9e36b6
-  Question: What government position was held by the woman who portrayed Corliss Archer in the film Kiss and Tell?
-  Answer:   Chief of Protocol
-  Type:     bridge | Level: hard
-  Contexts: 10 passages
-  SP Facts: 3 facts
-  Gold:     ['Kiss and Tell is a 1945 American comedy film starring then 17-year-old Shirley Temple as Corliss Archer.', "Shirley Temple Black (April 23, 1928 – February 10, 2014) was an American actress, singer, dancer, businesswoman, and diplomat who was Hollywood's number one box-office draw as a child actress from 1935 to 1938."]...
-
-  ID:       5a85ea095542994775f606a8
-  Question: What science fantasy young adult series, told in first person, has a set of companion books narrating the stories of enslaved worlds and alien species?
-  Answer:   Animorphs
-  Type:     bridge | Level: hard
-  Contexts: 10 passages
-  SP Facts: 5 facts
-  Gold:     ['The Hork-Bajir Chronicles is the second companion book to the "Animorphs" series, written by K. A. Applegate.', 'With respect to continuity within the series, it takes place before book #23, "The Pretender", although the events told in the story occur between the time of "The Ellimist Chronicles" and "The Andalite Chronicles".']...
-
----Stats---
-  total_examples: 7405
-  question_types: {'comparison': 1487, 'bridge': 5918}
-  difficulty_levels: {'hard': 7405}
-  unique_passages: 66635
-  avg_contexts_per_example: 9.952734638757596
-  avg_sp_facts_per_example: 2.4314652261985144
-"""
+        log.info(f"  {k}: {v}")
