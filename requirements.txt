@@ -23,5 +23,7 @@ transformers>=4.36
 # Fix for Keras 3 compatibility issue with transformers
 tf-keras>=2.15.0
 
-# Better retrieval (MPS compatible)
+# Retrieval
 sentence-transformers>=2.2.0
+rank-bm25>=0.2.2
+faiss-cpu>=1.7.4

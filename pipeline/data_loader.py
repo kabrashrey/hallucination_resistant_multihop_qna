@@ -358,17 +358,17 @@ if __name__ == "__main__":
 
     for ex in examples:
         print(f"  ID:       {ex.id}")
-        print(f"  Question: {ex.question}")
-        print(f"  Answer:   {ex.answer}")
-        print(f"  Type:     {ex.question_type} | Level: {ex.level}")
-        print(f"  Contexts: {len(ex.contexts)} passages")
-        print(f"  SP Facts: {len(ex.supporting_facts)} facts")
-        print(f"  Gold:     {ex.get_gold_sentences()[:2]}...")
+        print(f"Question: {ex.question}")
+        print(f"Answer:   {ex.answer}")
+        print(f"Type:     {ex.question_type} | Level: {ex.level}")
+        print(f"Contexts: {len(ex.contexts)} passages")
+        print(f"SP Facts: {len(ex.supporting_facts)} facts")
+        print(f"Gold:     {ex.get_gold_sentences()[:2]}...")
         print()
 
     print("---Stats---")
     for k, v in loader.get_stats().items():
-        print(f"  {k}: {v}")
+        print(f"{k}: {v}")
 
 
 """
