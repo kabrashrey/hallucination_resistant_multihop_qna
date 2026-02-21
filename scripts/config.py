@@ -79,7 +79,7 @@ def load_config(path: Union[str, Path, None] = None) -> Config:
 
     path = Path(path)
     if not path.exists():
-        from pipeline.logger import get_logger
+        from scripts.logger import get_logger
         get_logger("config").warning(f"Config not found at {path}, using defaults")
         return Config()
 
@@ -106,7 +106,7 @@ def load_config(path: Union[str, Path, None] = None) -> Config:
 
 if __name__ == "__main__":
     cfg = load_config()
-    from pipeline.logger import get_logger
+    from scripts.logger import get_logger
     log = get_logger("config")
     log.info(f"Data:")
     log.info(f"  distractor: {cfg.data.dev_distractor}")

@@ -20,7 +20,8 @@ from dataclasses import dataclass
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 from pipeline.data_loader import Passage
-from pipeline.logger import get_logger
+from scripts.config import load_config
+from scripts.logger import get_logger
 log = get_logger("indexer")
 
 
@@ -286,7 +287,6 @@ class HybridRetriever:
         Config Retriever
         Eg: retriever = HybridRetriever.from_config("configs/fast.yaml") # custom config
         """
-        from pipeline.config import load_config
         if cfg is None or isinstance(cfg, (str, Path)):
             cfg = load_config(cfg)
         r = cfg.retriever
@@ -624,7 +624,6 @@ class HybridRetriever:
 
 if __name__ == "__main__":
     from pipeline.data_loader import HotpotQALoader
-    from pipeline.config import load_config
     cfg = load_config()
 
     # Load data using config
