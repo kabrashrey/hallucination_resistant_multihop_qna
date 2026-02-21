@@ -1,0 +1,63 @@
+# ============================================================
+# HotpotQA Pipeline Configuration
+# ============================================================
+
+# --- Data ---
+data:
+  # Path to HotpotQA JSON files
+  dev_distractor: "data/hotpot_dev_distractor_v1.json"
+  dev_fullwiki: "data/hotpot_dev_fullwiki_v1.json"
+  test_fullwiki: "data/hotpot_test_fullwiki_v1.json"
+
+  # Max examples to load (null = load all)
+  limit: null
+
+# --- Retriever ---
+retriever:
+  # SentenceTransformer model for dense encoding
+  embed_model: "all-MiniLM-L6-v2"
+
+  # Device for encoding ("cpu", "cuda", "mps")
+  # NOTE: FAISS requires CPU on macOS, encoder is forced to CPU regardless
+  device: "cpu"
+
+  # Batch size for encoding passages
+  batch_size: 64
+
+  # --- Hybrid scoring ---
+  # ALPHAL weight for dense retriever (1-alpha = weight for BM25)
+  # alpha = 1.0 → pure dense retrieval, only semantic similarity
+  # alpha = 0.7 → 70% dense, 30% BM25
+  # alpha = 0.5 → equal balance
+  # alpha = 0.3 → 30% dense, 70% BM25
+  # alpha = 0.0 → pure BM25 retrieval, only keyword matching
+  alpha: 0.7
+  alpha_bridge: 0.85 # bridge questions: favor dense (needs reasoning across passages)
+  alpha_comparison: 0.5 # comparison questions: equal weight (entities are explicit)
+
+  # RRF constant (higher = smoother ranking, standard = 60, lower = more contrastive)
+  rrf_k: 20
+
+  # Candidate pool size for hybrid fusion
+  # Only the top-N from each retriever are fused (not the full corpus)
+  candidate_pool_size: 100
+
+  # Default top-k results to return
+  top_k: 10
+
+  # --- Multi-hop ---
+  multihop:
+    hops: 2 # number of retrieval iterations
+    top_k_per_hop: 5 # passages retrieved per hop
+    max_bridge_entities: 3 # max entities extracted per hop for query reformulation
+
+  # --- Persistence ---
+  index_cache_dir: "index_cache"
+
+# --- Evaluation ---
+eval:
+  # How many examples to evaluate on (null = all)
+  limit: 100
+
+  # Output predictions to these files
+  predictions_dir: "results"

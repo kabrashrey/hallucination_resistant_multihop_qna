@@ -1,31 +1,7 @@
 """
 Hybrid Multi-Hop Retriever: BM25 + FAISS
-The hybrid approach covers both cases — BM25 catches exact term matches that dense might miss, and dense catches semantic similarity that BM25 can't understand.
-
-1. Sparse retriever: BM25
-2. Dense retriever: FAISS
-3. Reciprocal Rank Fusion (RRF)
-4. Candidate Pooling
-5. Confidence Estimation
-6. Multi-hop itertive retrieval
-7. Bridge entity extraction
-8. Save/load support
-
-Usage:
-    from pipeline.data_loader import HotpotQALoader
-    from pipeline.indexer import HybridRetriever
-
-    loader = HotpotQALoader("data/hotpot_dev_distractor_v1.json")
-    passages = loader.get_all_passages()
-
-    retriever = HybridRetriever(embed_model="all-MiniLM-L6-v2")
-    retriever.index(passages)
-    retriever.save("index_cache")       # save to disk
-    retriever.load("index_cache")       # load from disk (skip re-encoding)
-    results = retriever.retrieve("Who directed Doctor Strange?", top_k=5)
-
-    # Multi-hop retrieval for bridge questions
-    results = retriever.retrieve_multihop("What position was held by the woman who played Corliss Archer?", hops=2, top_k=5)
+The hybrid approach covers both cases — BM25 catches exact term matches that dense might miss, 
+and dense catches semantic similarity that BM25 can't understand.
 """
 
 import os
@@ -44,6 +20,8 @@ from dataclasses import dataclass
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 from pipeline.data_loader import Passage
+from pipeline.logger import get_logger
+log = get_logger("indexer")
 
 
 @dataclass
@@ -277,7 +255,10 @@ class HybridRetriever:
                  alpha_bridge: Optional[float] = None,
                  alpha_comparison: Optional[float] = None,
                  rrf_k: int = 20,
-                 device: str = "cpu", batch_size: int = 64):
+                 candidate_pool_size: int = 100,
+                 device: str = "cpu", 
+                 batch_size: int = 64
+                ):
         """
         embed_model: SentenceTransformer model name for dense retrieval (default all-MiniLM-L6-v2)
         alpha: default weight for dense scores (1-alpha = weight for BM25)
@@ -286,24 +267,39 @@ class HybridRetriever:
         rrf_k: RRF constant (default 60, higher = smoother ranking)
         device: torch device for encoding ("cpu", "cuda", "mps")
         batch_size: batch size for encoding passages (default 64)
-
-        # ALPHA MEANING
-        alpha = 1.0 → pure dense retrieval, only semantic similarity
-        alpha = 0.7 → 70% dense, 30% BM25
-        alpha = 0.5 → equal balance
-        alpha = 0.3 → 30% dense, 70% BM25
-        alpha = 0.0 → pure BM25 retrieval, only keyword matching
         """
         self.alpha = alpha  # dense weight, controls balance between the two retrievers
         self.alpha_bridge = alpha_bridge           # None = use default alpha
         self.alpha_comparison = alpha_comparison   # None = use default alpha
         self.rrf_k = rrf_k
+        self.candidate_pool_size = candidate_pool_size
 
         self.bm25 = BM25Retriever() # sparse component
         self.dense = DenseRetriever(model_name=embed_model, device=device,
                                     batch_size=batch_size) # dense component
         self._passages: List[Passage] = []  # list of Passage objects
         self._texts: List[str] = [] # list of passage strings
+
+    @classmethod
+    def from_config(cls, cfg=None) -> "HybridRetriever":
+        """
+        Config Retriever
+        Eg: retriever = HybridRetriever.from_config("configs/fast.yaml") # custom config
+        """
+        from pipeline.config import load_config
+        if cfg is None or isinstance(cfg, (str, Path)):
+            cfg = load_config(cfg)
+        r = cfg.retriever
+        return cls(
+            embed_model=r.embed_model,
+            alpha=r.alpha,
+            alpha_bridge=r.alpha_bridge,
+            alpha_comparison=r.alpha_comparison,
+            rrf_k=r.rrf_k,
+            candidate_pool_size=r.candidate_pool_size,
+            device=r.device,
+            batch_size=r.batch_size,
+        )
 
     def _get_alpha(self, question_type: Optional[str] = None) -> float:
         if question_type == "bridge" and self.alpha_bridge is not None:
@@ -330,16 +326,16 @@ class HybridRetriever:
             self._passages = [Passage(title="", sentences=[str(p)]) for p in passages]
             self._texts = [str(p) for p in passages]
 
-        print(f"Indexing {len(self._texts)} passages...")
+        log.info(f"Indexing {len(self._texts)} passages...")
 
         # Build both indices
-        print("Building BM25 index...")
+        log.step("Building BM25 index...")
         self.bm25.index(self._texts)
 
-        print("Building FAISS dense index...")
+        log.step("Building FAISS dense index...")
         self.dense.index(self._texts, show_progress=show_progress)
 
-        print(f"{len(self._texts)} passages indexed.")
+        log.success(f"{len(self._texts)} passages indexed.")
 
     def save(self, save_dir: Union[str, Path]):
         """
@@ -377,7 +373,7 @@ class HybridRetriever:
         with open(save_dir / "config.json", "w") as f:
             json.dump(config, f, indent=2)
 
-        print(f"Saved index to {save_dir}/ ({len(self._passages)} passages)")
+        log.success(f"Saved index to {save_dir}/ ({len(self._passages)} passages)")
 
     def load(self, save_dir: Union[str, Path]):
         """
@@ -387,6 +383,8 @@ class HybridRetriever:
         save_dir = Path(save_dir)
         if not (save_dir / "faiss.index").exists():
             raise FileNotFoundError(f"No saved index in {save_dir}")
+
+        log.info(f"Loading index from {save_dir}/...")
 
         # Load FAISS
         self.dense.load(save_dir)
@@ -411,11 +409,11 @@ class HybridRetriever:
         self.alpha_comparison = config.get("alpha_comparison", self.alpha_comparison)
         self.rrf_k = config.get("rrf_k", self.rrf_k)
 
-        print(f"Loaded index from {save_dir}/ ({len(self._passages)} passages)")
+        log.success(f"Loaded index from {save_dir}/ ({len(self._passages)} passages)")
 
     def retrieve(self, query: str, top_k: int = 10,
                  question_type: Optional[str] = None,
-                 candidate_pool_size: int = 100) -> List[RetrievalResult]:
+                 candidate_pool_size: Optional[int] = None) -> List[RetrievalResult]:
         """
         Retrieve top-k passages using candidate-pool RRF scoring
 
@@ -435,7 +433,7 @@ class HybridRetriever:
             raise RuntimeError("Call .index() first")
 
         alpha = self._get_alpha(question_type)
-        pool_size = min(candidate_pool_size, len(self._passages))
+        pool_size = min(candidate_pool_size or self.candidate_pool_size, len(self._passages))
 
         # Get top-N candidates from each retriever (fast)
         bm25_top = self.bm25.top_k(query, pool_size)          # [(idx, score), ...]
@@ -626,12 +624,14 @@ class HybridRetriever:
 
 if __name__ == "__main__":
     from pipeline.data_loader import HotpotQALoader
+    from pipeline.config import load_config
+    cfg = load_config()
 
-    # Load a small subset
-    loader = HotpotQALoader("data/hotpot_dev_distractor_v1.json") # CHANGE THIS TO FULLWIKI DATASET
+    # Load data using config
+    loader = HotpotQALoader(cfg.data.dev_distractor)
     examples = loader.load(limit=50)
 
-    # Collect unique passages from those examples
+    # Collect unique passages
     seen = set()
     passages: List[Passage] = []
     for ex in examples:
@@ -641,38 +641,34 @@ if __name__ == "__main__":
                 seen.add(key)
                 passages.append(ctx)
 
-    print(f"\n{len(passages)} unique passages from {len(examples)} examples\n")
+    log.info(f"{len(passages)} unique passages from {len(examples)} examples")
 
-    # Build hybrid index with per-type alpha
-    retriever = HybridRetriever(
-        embed_model="all-MiniLM-L6-v2",
-        alpha=0.7,
-        alpha_bridge=0.85,       # bridge: favor dense (needs semantic understanding)
-        alpha_comparison=0.5,    # comparison: equal weight (entities are explicit)
-    )
+    # Build retriever from config
+    retriever = HybridRetriever.from_config(cfg)
     retriever.index(passages)
 
     # Save to disk
-    retriever.save("index_cache")
-    print("Saved.\n")
+    retriever.save(cfg.retriever.index_cache_dir)
 
-    # Load from disk (no re-encoding)
-    retriever2 = HybridRetriever(embed_model="all-MiniLM-L6-v2")
-    retriever2.load("index_cache")
-    print()
+    # Load from disk
+    retriever2 = HybridRetriever.from_config(cfg)
+    retriever2.load(cfg.retriever.index_cache_dir)
 
-    # Test single-hop (comparison) — with confidence
+    # Test single-hop (comparison)
     q1 = "Were Scott Derrickson and Ed Wood of the same nationality?"
-    print(f"Q (comparison): {q1}")
-    results = retriever2.retrieve(q1, top_k=3, question_type="comparison")
-    for r in results:
+    log.info(f"Q (comparison): {q1}")
+    results = retriever2.retrieve(q1, top_k=cfg.retriever.top_k, question_type="comparison")
+    for r in results[:3]:
         conf_str = f" conf={r.confidence:.2f}" if r.confidence > 0 else ""
-        print(f"[{r.rank}] score={r.score:.4f}{conf_str} title={r.passage.title}")
+        log.info(f"[{r.rank}] score={r.score:.4f}{conf_str} title={r.passage.title}")
 
-    # Test multi-hop (bridge) — shows entity extraction + hop info
+    # Test multi-hop (bridge)
     q2 = "What government position was held by the woman who portrayed Corliss Archer?"
-    print(f"\nQ (bridge, multi-hop): {q2}")
-    results = retriever2.retrieve_multihop(q2, hops=2, top_k=5, question_type="bridge")
+    log.info(f"Q (bridge, multi-hop): {q2}")
+    mh = cfg.retriever.multihop
+    results = retriever2.retrieve_multihop(q2, hops=mh.hops, top_k=5,
+                                           top_k_per_hop=mh.top_k_per_hop,
+                                           question_type="bridge")
     for r in results:
         conf_str = f" conf={r.confidence:.2f}" if r.confidence > 0 else ""
-        print(f"[{r.rank}] hop={r.hop} score={r.score:.4f}{conf_str} title={r.passage.title}")
+        log.info(f"[{r.rank}] hop={r.hop} score={r.score:.4f}{conf_str} title={r.passage.title}")
