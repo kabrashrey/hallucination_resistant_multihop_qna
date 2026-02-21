@@ -1,13 +1,6 @@
 """
 HotpotQA Dataset Loader
-"""
 
-import json
-from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Union
-
-"""
 @dataclass -- automatically generates __init__, __repr__, __eq__ etc. for you
 
 ####INSTEAD OF THIS:
@@ -29,6 +22,14 @@ class Passage:
     sentences: list
     passage_id: str = None
 """
+
+import json
+import sys
+from pathlib import Path
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Union
+from scripts.logger import get_logger
+log = get_logger("data_loader")
 
 @dataclass
 class Passage:
@@ -335,10 +336,6 @@ def load_hotpotqa_splits(
 
 
 if __name__ == "__main__":
-    import sys
-    from pipeline.logger import get_logger
-    log = get_logger("data_loader")
-
     if len(sys.argv) < 2:
         log.error("Usage: python -m pipeline.data_loader <path_to_hotpotqa.json> [limit]")
         sys.exit(1)
