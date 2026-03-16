@@ -13,12 +13,11 @@ import json
 import pickle
 import numpy as np
 from pathlib import Path
-from tqdm import tqdm
 import faiss
 from typing import List, Optional, Tuple, Union
 from dataclasses import dataclass
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+from pipeline.embedder import OllamaEmbedder
 from pipeline.data_loader import Passage
 from scripts.config import load_config
 from scripts.logger import get_logger
@@ -138,88 +137,60 @@ class BM25Retriever:
 
 
 class DenseRetriever:
-    """
-    Dense retriever using SentenceTransformers + FAISS --> Neural semantic retrieval
-    Encodes passages into vectors using neural network, uses FAISS for fast nearest-neighbor search
-    """
-
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: str = "cpu", batch_size: int = 64):
+    def __init__(
+        self,
+        model_name: str = "nomic-embed-text",
+        ollama_base_url: str = "http://localhost:11434",
+        batch_size: int = 64,
+        # legacy param kept so from_config() call sites don't break
+        device: str = "cpu",
+    ):
         self.model_name = model_name
-        self.encoder = SentenceTransformer(model_name, device="cpu") # forced CPU, since MPS causes error with FAISS
         self.batch_size = batch_size
-        self._index: Optional[faiss.IndexFlatIP] = None  # inner-product on unit vector = cosine
-        self._dim: int = 0 # embedding dimension (384 for MiniLM)
+        self.encoder = OllamaEmbedder(
+            model=model_name,
+            base_url=ollama_base_url,
+            batch_size=batch_size,
+        )
+        self._index: Optional[faiss.IndexFlatIP] = None
+        self._dim: int = self.encoder.dim
 
     def index(self, texts: List[str], show_progress: bool = True):
-        """
-        Encode all passages and build FAISS index
-        texts: list of passage strings (title + text)
-        """
-        # Encode in batches --> produces a (batch_size, 384) matrix, Normalize = True --> makes each vector unit length
-        all_embeddings = []
-        iterator = range(0, len(texts), self.batch_size)
-        if show_progress:
-            iterator = tqdm(iterator, desc="Encoding passages")
-
-        for i in iterator:
-            batch = texts[i:i + self.batch_size]
-            embeddings = self.encoder.encode(batch, convert_to_numpy=True,
-                                             show_progress_bar=False, normalize_embeddings=True)
-            all_embeddings.append(embeddings)
-
-        # concatenate all batches into one big (n_passages, 384) matrix
-        vectors = np.vstack(all_embeddings).astype(np.float32)
+        vectors = self.encoder.encode(texts, show_progress=show_progress)
         self._dim = vectors.shape[1]
 
-        # Build FAISS index (inner product = cosine similarity since vectors are normalized)
         self._index = faiss.IndexFlatIP(self._dim)
         self._index.add(vectors)
 
     def score(self, query: str) -> np.ndarray:
-        """
-        Score all passages for a query using cosine similarity via FAISS
-        Returns: array of shape (n_passages,)
-        """
         if self._index is None:
             raise RuntimeError("Call .index() first")
 
-        q_vec = self.encoder.encode([query], convert_to_numpy=True,
-                                    normalize_embeddings=True).astype(np.float32)
-        # Search all passages (k = total), returns top-n results sorted by cosine similarity
+        q_vec = self.encoder.encode_query(query).reshape(1, -1)
         n = self._index.ntotal
-        distances, indices = self._index.search(q_vec, n)   # Can use top_k instead of n to speed up for FullWiki
+        distances, indices = self._index.search(q_vec, n)
 
-        # Map back to original order, since FAISS returns results sorted by similarity
         scores = np.zeros(n, dtype=np.float32)
         scores[indices[0]] = distances[0]
         return scores
 
     def search_top_k(self, query: str, top_k: int) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        FAST top-k search without scoring all passages --> FAISS can stop early instead of scoring all passages
-        Returns: (scores, indices) arrays of shape (top_k,)
-        """
         if self._index is None:
             raise RuntimeError("Call .index() first")
 
-        q_vec = self.encoder.encode([query], convert_to_numpy=True,
-                                    normalize_embeddings=True).astype(np.float32)
+        q_vec = self.encoder.encode_query(query).reshape(1, -1)
         distances, indices = self._index.search(q_vec, top_k)
         return distances[0], indices[0]
 
     def encode_query(self, query: str) -> np.ndarray:
-        """Encode a single query into a vector (useful for multi-hop)"""
-        return self.encoder.encode([query], convert_to_numpy=True,
-                                   normalize_embeddings=True).astype(np.float32)[0]
+        return self.encoder.encode_query(query)
 
     def save(self, path: Path):
-        """Save FAISS index and metadata to disk"""
         faiss.write_index(self._index, str(path / "faiss.index"))
         with open(path / "dense_meta.json", "w") as f:
             json.dump({"dim": self._dim, "model_name": self.model_name}, f)
 
     def load(self, path: Path):
-        """Load FAISS index from disk (no re-encoding needed)"""
         self._index = faiss.read_index(str(path / "faiss.index"))
         with open(path / "dense_meta.json", "r") as f:
             meta = json.load(f)
@@ -231,55 +202,32 @@ class DenseRetriever:
 
 
 class HybridRetriever:
-    """
-    Combining BM25 (sparse) and FAISS (dense) with Reciprocal Rank Fusion
-    Final score = alpha * rrf_dense + (1 - alpha) * rrf_bm25
-
-      - Per-type alpha (different weights for bridge vs comparison questions)
-      - Multi-hop iterative retrieval for bridge questions
-      - Save/load indices to disk
-
-    Eg:
-        retriever = HybridRetriever(embed_model="all-MiniLM-L6-v2")
-        retriever.index(passages)
-        retriever.save("index_cache")
-
-        # Single-hop
-        results = retriever.retrieve("Who directed Doctor Strange?", top_k=5)
-
-        # Multi-hop (for bridge questions)
-        results = retriever.retrieve_multihop("What position was held by the actress in Kiss and Tell?", hops=2)
-    """
-
-    def __init__(self, embed_model: str = "all-MiniLM-L6-v2",
-                 alpha: float = 0.7,
-                 alpha_bridge: Optional[float] = None,
-                 alpha_comparison: Optional[float] = None,
-                 rrf_k: int = 20,
-                 candidate_pool_size: int = 100,
-                 device: str = "cpu", 
-                 batch_size: int = 64
-                ):
-        """
-        embed_model: SentenceTransformer model name for dense retrieval (default all-MiniLM-L6-v2)
-        alpha: default weight for dense scores (1-alpha = weight for BM25)
-        alpha_bridge: override alpha for bridge questions (needs multi-hop, favor dense)
-        alpha_comparison: override alpha for comparison questions (entities are explicit, favor BM25)
-        rrf_k: RRF constant (default 60, higher = smoother ranking)
-        device: torch device for encoding ("cpu", "cuda", "mps")
-        batch_size: batch size for encoding passages (default 64)
-        """
-        self.alpha = alpha  # dense weight, controls balance between the two retrievers
-        self.alpha_bridge = alpha_bridge           # None = use default alpha
-        self.alpha_comparison = alpha_comparison   # None = use default alpha
+    def __init__(
+        self,
+        embed_model: str = "nomic-embed-text",
+        ollama_base_url: str = "http://localhost:11434",
+        alpha: float = 0.7,
+        alpha_bridge: Optional[float] = None,
+        alpha_comparison: Optional[float] = None,
+        rrf_k: int = 20,
+        candidate_pool_size: int = 100,
+        device: str = "cpu",   # kept for API compat, unused (Ollama handles device)
+        batch_size: int = 64,
+    ):
+        self.alpha = alpha
+        self.alpha_bridge = alpha_bridge
+        self.alpha_comparison = alpha_comparison
         self.rrf_k = rrf_k
         self.candidate_pool_size = candidate_pool_size
 
-        self.bm25 = BM25Retriever() # sparse component
-        self.dense = DenseRetriever(model_name=embed_model, device=device,
-                                    batch_size=batch_size) # dense component
-        self._passages: List[Passage] = []  # list of Passage objects
-        self._texts: List[str] = [] # list of passage strings
+        self.bm25 = BM25Retriever()
+        self.dense = DenseRetriever(
+            model_name=embed_model,
+            ollama_base_url=ollama_base_url,
+            batch_size=batch_size,
+        )
+        self._passages: List[Passage] = []
+        self._texts: List[str] = []
 
     @classmethod
     def from_config(cls, cfg=None) -> "HybridRetriever":
@@ -292,6 +240,7 @@ class HybridRetriever:
         r = cfg.retriever
         return cls(
             embed_model=r.embed_model,
+            ollama_base_url=r.ollama_base_url,
             alpha=r.alpha,
             alpha_bridge=r.alpha_bridge,
             alpha_comparison=r.alpha_comparison,

@@ -1,0 +1,292 @@
+from dataclasses import dataclass
+from typing import List, Optional, Dict
+import re
+
+from pipeline.data_loader import Passage, SupportingFact
+from pipeline.indexer import RetrievalResult
+from pipeline.reranker import RerankResult
+from scripts.config import load_config
+from scripts.logger import get_logger
+
+log = get_logger("prompt_builder")
+
+BRIDGE_KEYWORDS = {"who", "which", "when", "where", "what", "how", "portrayed", "actor", "character", "played"}
+
+
+@dataclass
+class PromptBuilderOutput:
+    prompt: str                           
+    complexity_score: float               
+    target_model: str                     
+    passage_titles: List[str]             
+    supporting_fact_indices: Dict         
+    fact_mapping: Dict                    
+    metadata: Dict                        
+
+
+class PromptBuilder:
+    def __init__(self, cfg=None):
+        if cfg is None or isinstance(cfg, str):
+            cfg = load_config(cfg).prompt_builder
+        self.cfg = cfg
+        log.success("PromptBuilder initialized.")
+
+    @classmethod
+    def from_config(cls, cfg=None) -> "PromptBuilder":
+        if cfg is None or isinstance(cfg, (str,)):
+            cfg = load_config(cfg)
+        return cls(cfg.prompt_builder)
+
+    def build(
+        self,
+        query: str,
+        reranked_results: List[RerankResult],
+        include_metadata: bool = True,
+        use_citation_selection: bool = True,
+    ) -> PromptBuilderOutput:
+        if not reranked_results:
+            raise ValueError("No reranked results provided")
+        passage_titles = [r.passage.title for r in reranked_results]
+        num_passages = len(reranked_results)
+        evidence_block = self._format_evidence_block(reranked_results)
+        complexity_score = self._compute_complexity_score(query, reranked_results)
+        target_model = "complex" if complexity_score > self.cfg.complexity_routing_threshold else "simple"
+
+        supporting_fact_indices = self._extract_supporting_fact_indices(reranked_results)
+        facts_list_str, fact_mapping = self._format_facts_list(reranked_results)
+        if use_citation_selection:
+            instructions = self._build_instructions(query, facts_list_str=facts_list_str, fact_mapping=fact_mapping)
+        else:
+            instructions = self._build_instructions(query)
+
+        if self.cfg.evidence_first:
+            if use_citation_selection:
+                prompt = f"{evidence_block}\n\n{facts_list_str}\n\n{instructions}"
+            else:
+                prompt = f"{evidence_block}\n\n{instructions}"
+        else:
+            if use_citation_selection:
+                prompt = f"{facts_list_str}\n\n{instructions}\n\n{evidence_block}"
+            else:
+                prompt = f"{instructions}\n\n{evidence_block}"
+
+        if len(prompt) > self.cfg.max_evidence_chars:
+            log.warning(f"Prompt too long ({len(prompt)} chars), truncating to {self.cfg.max_evidence_chars}")
+            prompt = prompt[:self.cfg.max_evidence_chars] + "\n[... truncated ...]"
+
+        metadata = {} if not include_metadata else {
+            "num_passages": num_passages,
+            "prompt_length": len(prompt),
+            "complexity_raw": complexity_score,
+            "total_sentences": sum(len(r.supporting_sentences) for r in reranked_results),
+            "avg_retrieval_score": sum(r.retrieval_score for r in reranked_results) / num_passages,
+            "avg_rerank_score": sum(r.score for r in reranked_results) / num_passages,
+            "num_facts": len(fact_mapping),
+        }
+
+        return PromptBuilderOutput(
+            prompt=prompt,
+            complexity_score=complexity_score,
+            target_model=target_model,
+            passage_titles=passage_titles,
+            supporting_fact_indices=supporting_fact_indices,
+            fact_mapping=fact_mapping,
+            metadata=metadata,
+        )
+
+    def _format_evidence_block(self, results: List[RerankResult]) -> str:
+        lines = ["Evidence:"]
+
+        for passage_idx, result in enumerate(results):
+            passage = result.passage
+            lines.append(f"Passage {passage_idx}: {passage.title}")
+
+            for sent_str in result.supporting_sentences:
+                sent_idx = self._find_sentence_index(passage.sentences, sent_str)
+                if sent_idx is not None:
+                    display_sent = sent_str[:120] + "..." if len(sent_str) > 120 else sent_str
+                    lines.append(f"  [{sent_idx}] {display_sent}")
+
+        return "\n".join(lines)
+
+    def _find_sentence_index(self, sentences: List[str], target: str) -> Optional[int]:
+        target_norm = " ".join(target.split())
+        for i, sent in enumerate(sentences):
+            sent_norm = " ".join(sent.split())
+            if sent_norm == target_norm or sent_norm.startswith(target_norm[:50]):
+                return i
+        return 0
+
+    def _compute_complexity_score(self, query: str, results: List[RerankResult]) -> float:
+        score = 0.0
+
+        # Factor 1: Query length
+        has_long_query = len(query) > self.cfg.complexity_length_threshold
+        score += self.cfg.complexity_length_weight * float(has_long_query)
+
+        # Factor 2: Bridge keywords
+        query_lower = query.lower()
+        has_bridge_kw = any(kw in query_lower for kw in BRIDGE_KEYWORDS)
+        score += self.cfg.complexity_keywords_weight * float(has_bridge_kw)
+
+        # Factor 3: Confidence (how ambiguous is the retrieval?)
+        avg_confidence = sum(r.retrieval_score for r in results) / len(results) if results else 0.5
+        # Lower confidence = harder (invert the score)
+        confidence_penalty = 1.0 - min(avg_confidence, 1.0)
+        score += self.cfg.complexity_confidence_weight * confidence_penalty
+
+        # Factor 4: Supporting sentence count (many sentences = complex reasoning)
+        total_sentences = sum(len(r.supporting_sentences) for r in results)
+        has_many_sentences = total_sentences > self.cfg.complexity_sentence_threshold
+        score += self.cfg.complexity_sentences_weight * float(has_many_sentences)
+
+        return min(max(score, 0.0), 1.0)  # Clamp to [0, 1]
+
+    def _extract_supporting_fact_indices(self, results: List[RerankResult]) -> Dict:
+        fact_indices = {}
+
+        for passage_idx, result in enumerate(results):
+            passage = result.passage
+            facts = []
+
+            for sent_str in result.supporting_sentences:
+                sent_idx = self._find_sentence_index(passage.sentences, sent_str)
+                if sent_idx is not None:
+                    facts.append((passage.title, sent_idx))
+
+            fact_indices[passage_idx] = facts
+
+        return fact_indices
+
+    def _format_facts_list(self, results: List[RerankResult]) -> str:
+        lines = ["AVAILABLE FACTS:"]
+        fact_mapping = {}  # fact_number -> (title, sentence_idx)
+        fact_number = 0
+
+        for _, result in enumerate(results):
+            passage = result.passage
+            for sent_str in result.supporting_sentences:
+                sent_idx = self._find_sentence_index(passage.sentences, sent_str)
+                if sent_idx is not None:
+                    display_sent = sent_str[:100] + "..." if len(sent_str) > 100 else sent_str
+                    lines.append(f"Fact {fact_number}: [{passage.title}, {sent_idx}] {display_sent}")
+                    fact_mapping[fact_number] = (passage.title, sent_idx)
+                    fact_number += 1
+
+        return "\n".join(lines), fact_mapping
+
+    def _build_instructions(self, query: str, facts_list_str: str = "", fact_mapping: Dict = None) -> str:
+        if fact_mapping is not None and facts_list_str:
+            # Citation selection approach
+            instructions = f"""QUESTION: {query}
+
+{facts_list_str}
+
+TASK:
+1. Read the available facts carefully.
+2. Select which fact numbers (only numbers like 0, 1, 2, etc.) support your answer.
+3. Generate a short, direct answer using ONLY the evidence.
+
+RESPOND WITH THIS FORMAT - NOTHING ELSE:
+{{
+  "supporting_fact_numbers": [0, 1, 3],
+  "answer": "Short answer here"
+}}
+
+RULES:
+- Output ONLY the JSON block, no other text.
+- "supporting_fact_numbers" must be a list of numbers (e.g., [0], [1, 2, 5], []).
+- Only select fact numbers where the sentence directly supports your answer.
+- If no answer can be found, use: {{"supporting_fact_numbers": [], "answer": "Cannot determine from evidence"}}
+"""
+        else:
+            instructions = f"""Question: {query}
+
+Instructions:
+1. Read the evidence above carefully.
+2. Identify which evidence passages (Passage 0, 1, 2, etc.) are relevant to the question.
+3. Reason step-by-step using ONLY the evidence provided.
+4. List the supporting facts by citing the passage number and sentence index: [passage_num, sentence_idx].
+5. Generate a clear, concise answer based on the evidence.
+
+Output Format (JSON):
+{{
+  "supporting_facts": [[0, 0], [1, 3], [2, 1]],
+  "answer": "Your answer here"
+}}
+
+Important:
+- Output ONLY valid JSON, no additional text before or after.
+- supporting_facts is a list of [passage_number, sentence_index] pairs (NOT title).
+- Passage numbers are 0-4 as shown in the evidence block above.
+- If the answer cannot be determined from the evidence, set answer to "Cannot answer based on the provided evidence." with empty supporting_facts.
+"""
+        return instructions
+
+    def __repr__(self) -> str:
+        return (
+            f"PromptBuilder(evidence_first={self.cfg.evidence_first}, "
+            f"complexity_threshold={self.cfg.complexity_routing_threshold}, "
+            f"max_chars={self.cfg.max_evidence_chars})"
+        )
+
+
+if __name__ == "__main__":
+    from pipeline.data_loader import HotpotQALoader
+    from pipeline.indexer import HybridRetriever
+    from pipeline.reranker import Reranker
+
+    cfg = load_config()
+    loader = HotpotQALoader(cfg.data.dev_distractor)
+    examples = loader.load(limit=50)
+
+    seen = set()
+    passages = []
+    for ex in examples:
+        for ctx in ex.contexts:
+            key = (ctx.title, ctx.text)
+            if key not in seen:
+                seen.add(key)
+                passages.append(ctx)
+
+    log.info(f"Building retriever with {len(passages)} passages...")
+    retriever = HybridRetriever.from_config(cfg)
+    retriever.index(passages, show_progress=False)
+
+    log.info("Loading reranker...")
+    reranker = Reranker.from_config(cfg)
+
+    log.info("Initializing prompt builder...")
+    pb = PromptBuilder.from_config(cfg)
+
+    ex = examples[0]
+    log.info(f"\n{'='*80}")
+    log.info(f"Example: {ex.id}")
+    log.info(f"Question: {ex.question}")
+    log.info(f"Gold answer: {ex.answer}")
+    log.info(f"Gold SP: {[(sf.title, sf.sentence_index) for sf in ex.supporting_facts]}")
+
+    retrieved = retriever.retrieve_multihop(
+        ex.question, hops=2, top_k=20, question_type=ex.question_type
+    )
+    log.info(f"\nRetrieved {len(retrieved)} candidates")
+
+    reranked = reranker.rerank(ex.question, retrieved, top_k=5)
+    log.info(f"Re-ranked to {len(reranked)} passages")
+
+    output = pb.build(ex.question, reranked)
+
+    log.info(f"\n{'='*80}")
+    log.info(f"Complexity score: {output.complexity_score:.3f}")
+    log.info(f"Target model: {output.target_model}")
+    log.info(f"Prompt length: {len(output.prompt)} chars")
+
+    log.info(f"\n{'='*80}")
+    log.info("PROMPT:")
+    log.info(f"{'='*80}")
+    print(output.prompt)
+
+    log.info(f"\n{'='*80}")
+    log.info("Supporting fact indices (for parsing LLM output):")
+    for passage_idx, facts in output.supporting_fact_indices.items():
+        log.info(f"  Passage {passage_idx}: {facts}")

@@ -25,7 +25,8 @@ class MultihopConfig:
 
 @dataclass
 class RetrieverConfig:
-    embed_model: str = "all-MiniLM-L6-v2"
+    embed_model: str = "nomic-embed-text"
+    ollama_base_url: str = "http://localhost:11434"
     device: str = "cpu"
     batch_size: int = 64
     alpha: float = 0.7
@@ -39,6 +40,46 @@ class RetrieverConfig:
 
 
 @dataclass
+class RerankerConfig:
+    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    sentence_model_name: str = "nomic-embed-text"
+    device: str = "cpu"
+    top_k: int = 5                        
+    sentence_score_threshold: float = 0.4 
+    max_sentences_per_passage: int = 5    
+    batch_size: int = 32
+
+
+@dataclass
+class PromptBuilderConfig:
+    # Formatting options
+    include_passage_numbers: bool = True       
+    include_sentence_indices: bool = True      
+    evidence_first: bool = True                
+    max_evidence_chars: int = 12000             
+
+    complexity_length_weight: float = 0.25
+    complexity_length_threshold: int = 50
+    complexity_keywords_weight: float = 0.25
+    complexity_confidence_weight: float = 0.25
+    complexity_sentences_weight: float = 0.25
+    complexity_sentence_threshold: int = 5     
+    complexity_routing_threshold: float = 0.6  
+
+    temperature_small_model: float = 0.2       
+    temperature_large_model: float = 0.4       
+
+
+@dataclass
+class GeneratorConfig:
+    ollama_base_url: str = "http://localhost:11434"
+    model_small: str = "mistral:7b"
+    model_large: str = "mistral:7b"
+    request_timeout: int = 300           
+    validate_citations: bool = True    
+
+
+@dataclass
 class EvalConfig:
     limit: Optional[int] = 100
     predictions_dir: str = "results"
@@ -48,6 +89,9 @@ class EvalConfig:
 class Config:
     data: DataConfig = field(default_factory=DataConfig)
     retriever: RetrieverConfig = field(default_factory=RetrieverConfig)
+    reranker: RerankerConfig = field(default_factory=RerankerConfig)
+    prompt_builder: PromptBuilderConfig = field(default_factory=PromptBuilderConfig)
+    generator: GeneratorConfig = field(default_factory=GeneratorConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
 
 
@@ -97,6 +141,15 @@ def load_config(path: Union[str, Path, None] = None) -> Config:
         cfg.retriever = _dict_to_dataclass(RetrieverConfig, ret)
         if multihop_raw:
             cfg.retriever.multihop = _dict_to_dataclass(MultihopConfig, multihop_raw)
+
+    if "reranker" in raw:
+        cfg.reranker = _dict_to_dataclass(RerankerConfig, raw["reranker"])
+
+    if "prompt_builder" in raw:
+        cfg.prompt_builder = _dict_to_dataclass(PromptBuilderConfig, raw["prompt_builder"])
+
+    if "generator" in raw:
+        cfg.generator = _dict_to_dataclass(GeneratorConfig, raw["generator"])
 
     if "eval" in raw:
         cfg.eval = _dict_to_dataclass(EvalConfig, raw["eval"])

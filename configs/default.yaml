@@ -14,14 +14,16 @@ data:
 
 # --- Retriever ---
 retriever:
-  # SentenceTransformer model for dense encoding
-  embed_model: "all-MiniLM-L6-v2"
+  # Ollama embedding model for dense encoding (replaces HuggingFace SentenceTransformer)
+  embed_model: "nomic-embed-text"
 
-  # Device for encoding ("cpu", "cuda", "mps")
-  # NOTE: FAISS requires CPU on macOS, encoder is forced to CPU regardless
+  # Ollama server URL
+  ollama_base_url: "http://localhost:11434"
+
+  # Device kept for API compatibility (not used anymore, Ollama handles device internally)
   device: "cpu"
 
-  # Batch size for encoding passages
+  # Batch size for embedding passages
   batch_size: 64
 
   # --- Hybrid scoring ---
@@ -53,6 +55,60 @@ retriever:
 
   # --- Persistence ---
   index_cache_dir: "index_cache"
+
+# --- Re-Ranker ---
+reranker:
+  # Cross-encoder for passage re-ranking.
+  # Encodes (query, passage) jointly — much more accurate than bi-encoder dot product.
+  # ms-marco-MiniLM-L-6-v2 is fast (~6x faster than L-12) and strong on passage ranking.
+  model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+  # Ollama embedding model for sentence selection (same model as retriever).
+  sentence_model_name: "nomic-embed-text"
+
+  # device: "cpu"
+
+  # No. of passages kept after re-ranking (fed to prompt builder)
+  top_k: 5
+
+  # Min cosine similarity for a sentence to be selected as a supporting fact.
+  sentence_score_threshold: 0.4
+
+  # Max supporting sentences to keep per passage (to limit SP prediction)
+  max_sentences_per_passage: 3
+
+  # Batch size for cross-encoder inference
+  batch_size: 32
+
+# --- Prompt Builder ---
+prompt_builder:
+  # Formatting options
+  include_passage_numbers: true
+  include_sentence_indices: true
+  evidence_first: true
+  max_evidence_chars: 12000
+
+  # Complexity scoring weights (sum to 1.0 for normalized score)
+  complexity_length_weight: 0.25
+  complexity_length_threshold: 50       
+  complexity_keywords_weight: 0.25
+  complexity_confidence_weight: 0.25
+  complexity_sentences_weight: 0.25
+  complexity_sentence_threshold: 5      
+  complexity_routing_threshold: 0.6      "
+
+  # LLM temperatures
+  temperature_small_model: 0.1          # for simple queries
+  temperature_large_model: 0.3          # for complex queries
+
+# --- Generator ---
+generator:
+  ollama_base_url: "http://localhost:11434"
+  model_small: "llama3.1:8b"
+  model_large: "llama3.1:8b"
+  request_timeout: 120
+  validate_citations: true
+
 
 # --- Evaluation ---
 eval:
