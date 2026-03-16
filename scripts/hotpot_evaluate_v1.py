@@ -85,24 +85,23 @@ def eval(prediction_file, gold_file):
     with open(gold_file) as f:
         gold = json.load(f)
 
+    # Convert gold from list to dict indexed by ID (if needed)
+    if isinstance(gold, list):
+        gold = {item['_id']: item for item in gold}
+
     metrics = {'em': 0, 'f1': 0, 'prec': 0, 'recall': 0,
         'sp_em': 0, 'sp_f1': 0, 'sp_prec': 0, 'sp_recall': 0,
         'joint_em': 0, 'joint_f1': 0, 'joint_prec': 0, 'joint_recall': 0}
-    for dp in gold:
-        cur_id = dp['_id']
+    for cur_id, dp in gold.items():
         can_eval_joint = True
-        if cur_id not in prediction['answer']:
-            print('missing answer {}'.format(cur_id))
+        if cur_id not in prediction:
+            print('missing prediction {}'.format(cur_id))
             can_eval_joint = False
         else:
             em, prec, recall = update_answer(
-                metrics, prediction['answer'][cur_id], dp['answer'])
-        if cur_id not in prediction['sp']:
-            print('missing sp fact {}'.format(cur_id))
-            can_eval_joint = False
-        else:
+                metrics, prediction[cur_id]['answer'], dp['answer'])
             sp_em, sp_prec, sp_recall = update_sp(
-                metrics, prediction['sp'][cur_id], dp['supporting_facts'])
+                metrics, prediction[cur_id]['sp'], dp['supporting_facts'])
 
         if can_eval_joint:
             joint_prec = prec * sp_prec
