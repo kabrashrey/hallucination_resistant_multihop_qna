@@ -89,39 +89,44 @@ def eval(prediction_file, gold_file):
     if isinstance(gold, list):
         gold = {item['_id']: item for item in gold}
 
+    # Only evaluate examples present in both predictions and gold
+    matched_ids = set(gold.keys()) & set(prediction.keys())
+    N = len(matched_ids)
+    if N == 0:
+        print("No matching predictions found!")
+        sys.exit(1)
+
+    missing = len(gold) - N
+    if missing > 0:
+        print(f"Evaluating {N} / {len(gold)} examples ({missing} not in predictions, skipped)")
+
     metrics = {'em': 0, 'f1': 0, 'prec': 0, 'recall': 0,
         'sp_em': 0, 'sp_f1': 0, 'sp_prec': 0, 'sp_recall': 0,
         'joint_em': 0, 'joint_f1': 0, 'joint_prec': 0, 'joint_recall': 0}
-    for cur_id, dp in gold.items():
-        can_eval_joint = True
-        if cur_id not in prediction:
-            print('missing prediction {}'.format(cur_id))
-            can_eval_joint = False
+    for cur_id in matched_ids:
+        dp = gold[cur_id]
+        em, prec, recall = update_answer(
+            metrics, prediction[cur_id]['answer'], dp['answer'])
+        sp_em, sp_prec, sp_recall = update_sp(
+            metrics, prediction[cur_id]['sp'], dp['supporting_facts'])
+
+        joint_prec = prec * sp_prec
+        joint_recall = recall * sp_recall
+        if joint_prec + joint_recall > 0:
+            joint_f1 = 2 * joint_prec * joint_recall / (joint_prec + joint_recall)
         else:
-            em, prec, recall = update_answer(
-                metrics, prediction[cur_id]['answer'], dp['answer'])
-            sp_em, sp_prec, sp_recall = update_sp(
-                metrics, prediction[cur_id]['sp'], dp['supporting_facts'])
+            joint_f1 = 0.
+        joint_em = em * sp_em
 
-        if can_eval_joint:
-            joint_prec = prec * sp_prec
-            joint_recall = recall * sp_recall
-            if joint_prec + joint_recall > 0:
-                joint_f1 = 2 * joint_prec * joint_recall / (joint_prec + joint_recall)
-            else:
-                joint_f1 = 0.
-            joint_em = em * sp_em
+        metrics['joint_em'] += joint_em
+        metrics['joint_f1'] += joint_f1
+        metrics['joint_prec'] += joint_prec
+        metrics['joint_recall'] += joint_recall
 
-            metrics['joint_em'] += joint_em
-            metrics['joint_f1'] += joint_f1
-            metrics['joint_prec'] += joint_prec
-            metrics['joint_recall'] += joint_recall
-
-    N = len(gold)
     for k in metrics.keys():
         metrics[k] /= N
 
-    print(metrics)
+    print(json.dumps(metrics, indent=2))
 
 if __name__ == '__main__':
     eval(sys.argv[1], sys.argv[2])

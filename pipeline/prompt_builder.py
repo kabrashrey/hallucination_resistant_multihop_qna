@@ -46,14 +46,22 @@ class PromptBuilder:
     ) -> PromptBuilderOutput:
         if not reranked_results:
             raise ValueError("No reranked results provided")
+
+        # Sort by reranker score (highest first) for better LLM prioritization
+        reranked_results = sorted(reranked_results, key=lambda r: r.score, reverse=True)
+
         passage_titles = [r.passage.title for r in reranked_results]
         num_passages = len(reranked_results)
         evidence_block = self._format_evidence_block(reranked_results)
         complexity_score = self._compute_complexity_score(query, reranked_results)
-        target_model = "complex" if complexity_score > self.cfg.complexity_routing_threshold else "simple"
 
         supporting_fact_indices = self._extract_supporting_fact_indices(reranked_results)
         facts_list_str, fact_mapping = self._format_facts_list(reranked_results)
+
+        # Ensure complexity_routing_threshold is a float (defensive cast for config loading issues)
+        threshold = float(self.cfg.complexity_routing_threshold) if hasattr(self.cfg, 'complexity_routing_threshold') else 0.6
+        target_model = "complex" if complexity_score > threshold else "simple"
+
         if use_citation_selection:
             instructions = self._build_instructions(query, facts_list_str=facts_list_str, fact_mapping=fact_mapping)
         else:
@@ -61,12 +69,12 @@ class PromptBuilder:
 
         if self.cfg.evidence_first:
             if use_citation_selection:
-                prompt = f"{evidence_block}\n\n{facts_list_str}\n\n{instructions}"
+                prompt = f"{evidence_block}\n\n{instructions}"
             else:
                 prompt = f"{evidence_block}\n\n{instructions}"
         else:
             if use_citation_selection:
-                prompt = f"{facts_list_str}\n\n{instructions}\n\n{evidence_block}"
+                prompt = f"{instructions}\n\n{evidence_block}"
             else:
                 prompt = f"{instructions}\n\n{evidence_block}"
 
@@ -99,7 +107,9 @@ class PromptBuilder:
 
         for passage_idx, result in enumerate(results):
             passage = result.passage
-            lines.append(f"Passage {passage_idx}: {passage.title}")
+            # Include relevance score (0-1) in passage header to guide LLM
+            relevance = max(0.0, min(1.0, result.score))  # Clamp to [0, 1]
+            lines.append(f"Passage {passage_idx}: [{passage.title} (relevance: {relevance:.2f})]")
 
             for sent_str in result.supporting_sentences:
                 sent_idx = self._find_sentence_index(passage.sentences, sent_str)
@@ -115,7 +125,7 @@ class PromptBuilder:
             sent_norm = " ".join(sent.split())
             if sent_norm == target_norm or sent_norm.startswith(target_norm[:50]):
                 return i
-        return 0
+        return None
 
     def _compute_complexity_score(self, query: str, results: List[RerankResult]) -> float:
         score = 0.0
@@ -182,22 +192,53 @@ class PromptBuilder:
 
 {facts_list_str}
 
-TASK:
-1. Read the available facts carefully.
-2. Select which fact numbers (only numbers like 0, 1, 2, etc.) support your answer.
-3. Generate a short, direct answer using ONLY the evidence.
+EXAMPLES:
 
-RESPOND WITH THIS FORMAT - NOTHING ELSE:
+Example 1 (bridge question):
+AVAILABLE FACTS:
+Fact 0: [The Departed, 0] The Departed is a 2006 American crime film directed by Martin Scorsese.
+Fact 1: [The Departed, 2] The film stars Leonardo DiCaprio, Matt Damon, and Jack Nicholson.
+Fact 2: [Martin Scorsese, 0] Martin Scorsese is an American film director born in 1942.
+Fact 3: [Martin Scorsese, 1] He was born in Queens, New York City.
+
+Question: Where was the director of The Departed born?
+{{"reasoning": "Fact 0 identifies Martin Scorsese as the director. Fact 3 states he was born in Queens, New York City.", "supporting_fact_numbers": [0, 2, 3], "answer": "Queens, New York City"}}
+
+Example 2 (comparison question, entity answer):
+AVAILABLE FACTS:
+Fact 0: [Oceanview High, 0] Oceanview High School was founded in 1965.
+Fact 1: [Oceanview High, 1] It is located in Santa Monica, California.
+Fact 2: [Ridgemont Academy, 0] Ridgemont Academy was established in 1948.
+Fact 3: [Ridgemont Academy, 2] The school has won multiple state championships.
+
+Question: Which school was founded first, Oceanview High or Ridgemont Academy?
+{{"reasoning": "Fact 0 says Oceanview High was founded in 1965. Fact 2 says Ridgemont Academy was established in 1948. 1948 is earlier than 1965.", "supporting_fact_numbers": [0, 2], "answer": "Ridgemont Academy"}}
+
+Example 3 (comparison question, yes/no answer):
+AVAILABLE FACTS:
+Fact 0: [Silver Hawks, 0] The Silver Hawks are a rock band formed in London in 2003.
+Fact 1: [Silver Hawks, 1] The band consists of four members.
+Fact 2: [The Embers, 0] The Embers are an indie group from Manchester.
+Fact 3: [The Embers, 1] They have four members and formed in 2001.
+
+Question: Do the Silver Hawks and The Embers have the same number of members?
+{{"reasoning": "Fact 1 says Silver Hawks has four members. Fact 3 says The Embers have four members. They are equal.", "supporting_fact_numbers": [1, 3], "answer": "yes"}}
+
+TASK: Answer the question using ONLY the available facts. Think step by step.
+
+RESPOND WITH THIS JSON FORMAT - NOTHING ELSE:
 {{
+  "reasoning": "Brief chain of thought connecting the facts to the answer",
   "supporting_fact_numbers": [0, 1, 3],
   "answer": "Short answer here"
 }}
 
 RULES:
 - Output ONLY the JSON block, no other text.
-- "supporting_fact_numbers" must be a list of numbers (e.g., [0], [1, 2, 5], []).
-- Only select fact numbers where the sentence directly supports your answer.
-- If no answer can be found, use: {{"supporting_fact_numbers": [], "answer": "Cannot determine from evidence"}}
+- "reasoning": briefly explain how the facts connect to your answer.
+- "supporting_fact_numbers": list ALL fact numbers that support your answer, including facts that establish context or connect entities.
+- "answer": short and direct (a few words). For yes/no questions, answer "yes" or "no" (lowercase).
+- If no answer can be found: {{"reasoning": "...", "supporting_fact_numbers": [], "answer": "Cannot determine from evidence"}}
 """
         else:
             instructions = f"""Question: {query}

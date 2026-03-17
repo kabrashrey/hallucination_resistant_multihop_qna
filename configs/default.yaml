@@ -15,7 +15,8 @@ data:
 # --- Retriever ---
 retriever:
   # Ollama embedding model for dense encoding (replaces HuggingFace SentenceTransformer)
-  embed_model: "nomic-embed-text"
+  # Upgraded from nomic-embed-text (2K context, 768-dim) to qwen3-embedding:8b (40K context)
+  embed_model: "qwen3-embedding:8b"
 
   # Ollama server URL
   ollama_base_url: "http://localhost:11434"
@@ -23,8 +24,8 @@ retriever:
   # Device kept for API compatibility (not used anymore, Ollama handles device internally)
   device: "cpu"
 
-  # Batch size for embedding passages
-  batch_size: 64
+  # Batch size for embedding passages — reduced from 64 for larger model
+  batch_size: 32
 
   # --- Hybrid scoring ---
   # ALPHAL weight for dense retriever (1-alpha = weight for BM25)
@@ -50,8 +51,8 @@ retriever:
   # --- Multi-hop ---
   multihop:
     hops: 2 # number of retrieval iterations
-    top_k_per_hop: 5 # passages retrieved per hop
-    max_bridge_entities: 3 # max entities extracted per hop for query reformulation
+    top_k_per_hop: 10 # passages retrieved per hop (doubled from 5 for better recall)
+    max_bridge_entities: 5 # max entities extracted per hop for query reformulation (raised from 3)
 
   # --- Persistence ---
   index_cache_dir: "index_cache"
@@ -63,19 +64,23 @@ reranker:
   # ms-marco-MiniLM-L-6-v2 is fast (~6x faster than L-12) and strong on passage ranking.
   model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-  # Ollama embedding model for sentence selection (same model as retriever).
-  sentence_model_name: "nomic-embed-text"
+  # Ollama embedding model for sentence selection (must match retriever embed_model).
+  sentence_model_name: "qwen3-embedding:8b"
 
   # device: "cpu"
 
   # No. of passages kept after re-ranking (fed to prompt builder)
+  # Reverted from 7→5: wider retrieval (top_k_per_hop=10) feeds enough candidates,
+  # but 7 passages overwhelms the LLM (EM dropped 32%). Keep presentation narrow.
   top_k: 5
 
   # Min cosine similarity for a sentence to be selected as a supporting fact.
-  sentence_score_threshold: 0.4
+  # Lowered from 0.4 to improve SP recall (was 30%, targeting >40%)
+  sentence_score_threshold: 0.25
 
   # Max supporting sentences to keep per passage (to limit SP prediction)
-  max_sentences_per_passage: 3
+  # Reverted from 7→5: too many sentences per passage overwhelms the LLM
+  max_sentences_per_passage: 5
 
   # Batch size for cross-encoder inference
   batch_size: 32
@@ -94,8 +99,8 @@ prompt_builder:
   complexity_keywords_weight: 0.25
   complexity_confidence_weight: 0.25
   complexity_sentences_weight: 0.25
-  complexity_sentence_threshold: 5      
-  complexity_routing_threshold: 0.6      "
+  complexity_sentence_threshold: 5
+  complexity_routing_threshold: 0.6
 
   # LLM temperatures
   temperature_small_model: 0.1          # for simple queries
@@ -104,10 +109,11 @@ prompt_builder:
 # --- Generator ---
 generator:
   ollama_base_url: "http://localhost:11434"
-  model_small: "llama3.1:8b"
-  model_large: "llama3.1:8b"
-  request_timeout: 120
+  model_small: "qwen2.5:7b"
+  model_large: "qwen2.5:7b"
+  request_timeout: 300
   validate_citations: true
+  retry_on_parse_failure: true
 
 
 # --- Evaluation ---

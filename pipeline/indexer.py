@@ -442,10 +442,12 @@ class HybridRetriever:
         Extract potential bridge entities from a passage that could be used for hop 2
 
         Catches:
+          - Passage title (primary source for entity names)
           - Multi-word names:   "Shirley Temple", "New York City"
           - Acronyms:           "NASA", "FBI", "UNESCO"
           - Single-name entities: "Cher", "Madonna", "Beyoncé"
           - Titles with punctuation: "Dr. Strange", "St. Louis"
+          - Parenthetical context: "(1928-1992)", "(actress)"
         """
         import re
         question_lower = question.lower()
@@ -453,8 +455,13 @@ class HybridRetriever:
 
         entities = []
 
-        # Multi-word capitalized phrases ("Shirley Temple", "New York City") and titles with punctuation: "Dr. Strange", "St. Louis"
-        entities += re.findall(r'\b([A-Z][a-z]*\.?\s+(?:[A-Z][a-z]*\.?\s*)+)', text)
+        # Passage title is primary bridge source (often contains entity names like "Shirley Temple")
+        if passage.title and passage.title.strip():
+            entities.append(passage.title)
+
+        # Multi-word capitalized phrases ("Shirley Temple", "New York City", "Dr. Strange", "St. Louis")
+        # Improved pattern: catches 2+ consecutive capitalized words
+        entities += re.findall(r'\b([A-Z][a-z]+ [A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', text)
 
         # Acronyms — 2+ consecutive uppercase letters ("NASA", "FBI", "MCU")
         entities += re.findall(r'\b([A-Z]{2,})\b', text)
@@ -462,21 +469,27 @@ class HybridRetriever:
         # Single capitalized words that appear mid-sentence, exclude sentence starters by requiring a lowercase letter or punctuation before
         entities += re.findall(r'(?<=[a-z.,;:!?]\s)([A-Z][a-zà-ÿ]{2,})\b', text)
 
-        # Also include the passage title itself as a candidate
-        candidates = [passage.title] + [e.strip() for e in entities]
+        # Parenthetical context (dates, descriptions) - "Shirley Temple (1928-1992)"
+        # Extract text in parentheses that might be useful context
+        entities += re.findall(r'\(([^)]+)\)', text)[:3]  # limit to 3 parenthetical contexts
 
         # Filter out entities already in the question
         bridge = []
         seen = set()
-        for entity in candidates:
+        for entity in entities:
             entity_clean = entity.strip().rstrip('.')
             if (entity_clean.lower() not in question_lower
                     and entity_clean not in seen
-                    and len(entity_clean) > 1):
+                    and len(entity_clean) > 1
+                    and entity_clean != passage.title):  # don't duplicate title
                 seen.add(entity_clean)
                 bridge.append(entity_clean)
 
-        return bridge[:5]  # limit to top 5 entities
+        # Always include passage title as fallback if not already added
+        if passage.title and passage.title.strip() and passage.title not in bridge:
+            bridge.insert(0, passage.title)
+
+        return bridge[:7]  # increased limit to 7 entities for better hop 2 coverage
 
     def retrieve_multihop(self, query: str, hops: int = 2, top_k: int = 10,
                           top_k_per_hop: int = 5,
@@ -534,8 +547,11 @@ class HybridRetriever:
 
             # Reformulate query for next hop using extracted entities
             if hop < hops - 1 and bridge_entities:
-                # Deduplicate and take top entities
-                unique_entities = list(dict.fromkeys(bridge_entities))[:3]
+                # Prioritize title entities over body entities for hop-2 query
+                hop_passage_titles = {r.passage.title for r in hop_results}
+                title_entities = [e for e in bridge_entities if e in hop_passage_titles]
+                body_entities = [e for e in bridge_entities if e not in hop_passage_titles]
+                unique_entities = list(dict.fromkeys(title_entities + body_entities))[:5]
                 entity_str = " ".join(unique_entities)
                 current_query = f"{query} {entity_str}"
 

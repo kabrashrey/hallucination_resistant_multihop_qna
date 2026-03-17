@@ -143,16 +143,33 @@ class Reranker:
             sents = all_sentences[start:end]
             scores = sim_scores[start:end].tolist()
 
+            # Title-match boost: if passage title words overlap with query, boost all sentence scores
+            title_words = {w.lower() for w in r.passage.title.split() if len(w) > 2}
+            query_words = {w.lower() for w in query.split()}
+            if title_words & query_words:
+                scores = [s + 0.05 for s in scores]
+
             paired = sorted(zip(scores, sents), reverse=True)
             selected_sents = []
             selected_scores = []
-            for score, sent in paired:
-                if score < self.sentence_score_threshold:
-                    break
-                selected_sents.append(sent)
-                selected_scores.append(round(float(score), 4))
-                if len(selected_sents) >= self.max_sentences_per_passage:
-                    break
+
+            # Rank-aware guaranteed minimum: top passages get more sentences
+            if r.rank <= 1:
+                min_guarantee = 4  # Top 2 passages: guarantee 4 sentences
+            elif r.rank <= 3:
+                min_guarantee = 3  # Middle passages: guarantee 3
+            else:
+                min_guarantee = 2  # Lower passages: guarantee 2
+
+            for i, (score, sent) in enumerate(paired):
+                if i < min_guarantee:
+                    selected_sents.append(sent)
+                    selected_scores.append(round(float(score), 4))
+                elif score >= self.sentence_score_threshold and len(selected_sents) < self.max_sentences_per_passage:
+                    selected_sents.append(sent)
+                    selected_scores.append(round(float(score), 4))
+                else:
+                    break  # Sorted descending — all remaining are below threshold
 
             r.supporting_sentences = selected_sents
             r.sentence_scores = selected_scores
