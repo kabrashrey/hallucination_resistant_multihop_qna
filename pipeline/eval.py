@@ -54,7 +54,16 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
     if limit:
         examples = examples[:limit]
 
+    # Stage-by-stage recall diagnostics
+    diag = {"retrieval": [], "rerank": [], "sentence": [], "prediction": []}
+
+    reranker_top_k = getattr(cfg.reranker, 'top_k', 7)
+
     for ex in tqdm(examples, desc="Running pipeline"):
+        # Gold supporting facts for this example
+        gold_titles = {sf.title for sf in ex.supporting_facts}
+        gold_facts = {(sf.title, sf.sentence_index) for sf in ex.supporting_facts}
+
         retrieved = retriever.retrieve_multihop(
             ex.question, hops=2, top_k=20, question_type=ex.question_type
         )
@@ -64,9 +73,34 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
                 "answer": "Cannot answer based on the provided evidence.",
                 "sp": [],
             }
+            for stage in diag:
+                diag[stage].append(0.0)
             continue
 
-        reranked = reranker.rerank(ex.question, retrieved, top_k=5, select_sentences=True)
+        # Diagnostic: retrieval recall (gold titles in retrieved candidates)
+        retrieved_titles = {r.passage.title for r in retrieved}
+        retrieval_recall = len(gold_titles & retrieved_titles) / len(gold_titles) if gold_titles else 0.0
+        diag["retrieval"].append(retrieval_recall)
+
+        reranked = reranker.rerank(ex.question, retrieved, top_k=reranker_top_k, select_sentences=True)
+
+        # Diagnostic: rerank recall (gold titles surviving reranker cut)
+        reranked_titles = {r.passage.title for r in reranked}
+        rerank_recall = len(gold_titles & reranked_titles) / len(gold_titles) if gold_titles else 0.0
+        diag["rerank"].append(rerank_recall)
+
+        # Diagnostic: sentence recall (gold (title, sent_idx) in selected sentences)
+        selected_facts = set()
+        for r in reranked:
+            for sent_str in r.supporting_sentences:
+                # Find sentence index in passage
+                for idx, s in enumerate(r.passage.sentences):
+                    if " ".join(s.split()) == " ".join(sent_str.split()) or " ".join(s.split()).startswith(" ".join(sent_str.split())[:50]):
+                        selected_facts.add((r.passage.title, idx))
+                        break
+        sentence_recall = len(gold_facts & selected_facts) / len(gold_facts) if gold_facts else 0.0
+        diag["sentence"].append(sentence_recall)
+
         pb_output = pb.build(ex.question, reranked, use_citation_selection=True)
         try:
             gen_output = gen.generate(
@@ -87,11 +121,34 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
             answer = "Cannot answer based on the provided evidence."
             supporting_facts = []
 
+        # Diagnostic: prediction recall (gold facts in LLM output)
+        pred_facts = {(sf[0], sf[1]) for sf in supporting_facts} if supporting_facts else set()
+        pred_recall = len(gold_facts & pred_facts) / len(gold_facts) if gold_facts else 0.0
+        diag["prediction"].append(pred_recall)
+
         #dict indexed by ID, no "id" field needed
         predictions[ex.id] = {
             "answer": answer,
             "sp": supporting_facts,  # List of [title, sentence_index]
         }
+
+    # Summary stats
+    empty_sp = sum(1 for p in predictions.values() if not p["sp"])
+    empty_ans = sum(1 for p in predictions.values() if not p["answer"] or p["answer"] == "Cannot answer based on the provided evidence.")
+    log.info(f"Pipeline summary: {len(predictions)} predictions, {empty_sp} with empty SP, {empty_ans} with no/abstain answer")
+
+    # Stage-by-stage recall diagnostics
+    n = len(diag["retrieval"])
+    if n > 0:
+        log.info(f"\n{'='*60}")
+        log.info(f"STAGE-BY-STAGE RECALL DIAGNOSTICS (n={n})")
+        log.info(f"{'='*60}")
+        for stage, values in diag.items():
+            mean_val = sum(values) / len(values) if values else 0.0
+            perfect = sum(1 for v in values if v >= 1.0)
+            zero = sum(1 for v in values if v <= 0.0)
+            log.info(f"  {stage:>12s}: mean={mean_val:.1%}  perfect={perfect}/{n}  zero={zero}/{n}")
+        log.info(f"{'='*60}")
 
     return predictions
 

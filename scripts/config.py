@@ -75,8 +75,9 @@ class GeneratorConfig:
     ollama_base_url: str = "http://localhost:11434"
     model_small: str = "mistral:7b"
     model_large: str = "mistral:7b"
-    request_timeout: int = 300           
-    validate_citations: bool = True    
+    request_timeout: int = 300
+    validate_citations: bool = True
+    retry_on_parse_failure: bool = True
 
 
 @dataclass
