@@ -51,8 +51,13 @@ retriever:
   # --- Multi-hop ---
   multihop:
     hops: 2 # number of retrieval iterations
-    top_k_per_hop: 10 # passages retrieved per hop (doubled from 5 for better recall)
+    top_k_per_hop: 15 # passages retrieved per hop (widened from 10 for better recall)
     max_bridge_entities: 5 # max entities extracted per hop for query reformulation (raised from 3)
+    hop2_strategy: "both"                          # "title" (B), "concat" (legacy), "both" (B+D)
+    llm_decompose_confidence_threshold: 0.3        # trigger LLM decomposition below this hop-1 confidence
+    llm_decompose_backend: "anthropic"             # "anthropic" or "ollama"
+    llm_decompose_model: "claude-haiku-4-5-20251001"
+    llm_decompose_ollama_model: "qwen2.5:7b"
 
   # --- Persistence ---
   index_cache_dir: "index_cache"
@@ -61,8 +66,8 @@ retriever:
 reranker:
   # Cross-encoder for passage re-ranking.
   # Encodes (query, passage) jointly — much more accurate than bi-encoder dot product.
-  # ms-marco-MiniLM-L-6-v2 is fast (~6x faster than L-12) and strong on passage ranking.
-  model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  # BAAI/bge-reranker-v2-m3: SOTA multilingual reranker (upgraded from ms-marco-MiniLM-L-6-v2)
+  model_name: "BAAI/bge-reranker-v2-m3"
 
   # Ollama embedding model for sentence selection (must match retriever embed_model).
   sentence_model_name: "qwen3-embedding:8b"
@@ -111,9 +116,12 @@ generator:
   ollama_base_url: "http://localhost:11434"
   model_small: "qwen2.5:7b"
   model_large: "qwen2.5:7b"
-  request_timeout: 300
+  request_timeout: 600
   validate_citations: true
   retry_on_parse_failure: true
+  backend: "ollama"                        # "ollama" or "anthropic"
+  anthropic_model: "claude-haiku-4-5-20251001"  # Claude model (used when backend=anthropic)
+  specialist_mode: true                    # true: Haiku selects facts, Ollama answers
 
 
 # --- Evaluation ---

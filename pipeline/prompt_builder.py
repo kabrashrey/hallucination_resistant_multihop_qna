@@ -224,21 +224,20 @@ Fact 3: [The Embers, 1] They have four members and formed in 2001.
 Question: Do the Silver Hawks and The Embers have the same number of members?
 {{"reasoning": "Fact 1 says Silver Hawks has four members. Fact 3 says The Embers have four members. They are equal.", "supporting_fact_numbers": [1, 3], "answer": "yes"}}
 
-TASK: Answer the question using ONLY the available facts. Think step by step.
+TASK: Answer the question using ONLY the available facts.
 
 RESPOND WITH THIS JSON FORMAT - NOTHING ELSE:
-{{
-  "reasoning": "Brief chain of thought connecting the facts to the answer",
-  "supporting_fact_numbers": [0, 1, 3],
-  "answer": "Short answer here"
-}}
+{{"reasoning": "Brief chain of thought", "supporting_fact_numbers": [0, 1, 3], "answer": "entity or yes/no"}}
 
 RULES:
-- Output ONLY the JSON block, no other text.
+- Output ONLY the JSON block, no other text before or after.
 - "reasoning": briefly explain how the facts connect to your answer.
-- "supporting_fact_numbers": list ALL fact numbers that support your answer, including facts that establish context or connect entities.
-- "answer": short and direct (a few words). For yes/no questions, answer "yes" or "no" (lowercase).
-- If no answer can be found: {{"reasoning": "...", "supporting_fact_numbers": [], "answer": "Cannot determine from evidence"}}
+- "supporting_fact_numbers": list ALL fact numbers that support your answer, including bridging facts.
+- "answer": 1-5 words MAXIMUM. Extract the specific entity, name, date, or yes/no. Never use full sentences.
+  BAD: "The film was directed by Martin Scorsese" GOOD: "Martin Scorsese"
+  BAD: "decisive defeat for Italy and secured Ethiopian sovereignty" GOOD: "Battle of Adwa"
+- For yes/no questions, answer "yes" or "no" (lowercase only).
+- You MUST attempt an answer if ANY facts are relevant. Only respond "Cannot determine from evidence" if the facts are completely unrelated to the question.
 """
         else:
             instructions = f"""Question: {query}

@@ -116,10 +116,12 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
             )
             answer = gen_output.answer
             supporting_facts = gen_output.supporting_facts
+            full_response = gen_output.full_response
         except Exception as e:
             log.warning(f"Generation failed for {ex.id}: {e}")
             answer = "Cannot answer based on the provided evidence."
             supporting_facts = []
+            full_response = ""
 
         # Diagnostic: prediction recall (gold facts in LLM output)
         pred_facts = {(sf[0], sf[1]) for sf in supporting_facts} if supporting_facts else set()
@@ -128,8 +130,11 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
 
         #dict indexed by ID, no "id" field needed
         predictions[ex.id] = {
+            "question": ex.question,
+            "gold_answer": ex.answer,
             "answer": answer,
             "sp": supporting_facts,  # List of [title, sentence_index]
+            "full_response": full_response,
         }
 
     # Summary stats
