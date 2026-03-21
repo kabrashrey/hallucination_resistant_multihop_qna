@@ -55,7 +55,7 @@ retriever:
     max_bridge_entities: 5 # max entities extracted per hop for query reformulation (raised from 3)
     hop2_strategy: "both"                          # "title" (B), "concat" (legacy), "both" (B+D)
     llm_decompose_confidence_threshold: 0.3        # trigger LLM decomposition below this hop-1 confidence
-    llm_decompose_backend: "anthropic"             # "anthropic" or "ollama"
+    llm_decompose_backend: "ollama"                 # "anthropic" or "ollama"
     llm_decompose_model: "claude-haiku-4-5-20251001"
     llm_decompose_ollama_model: "qwen2.5:7b"
 
@@ -86,6 +86,12 @@ reranker:
   # Max supporting sentences to keep per passage (to limit SP prediction)
   # Reverted from 7→5: too many sentences per passage overwhelms the LLM
   max_sentences_per_passage: 5
+
+  # Only select sentences from top N reranked passages (saves embedding calls)
+  sentence_passage_limit: 5
+
+  # Additive boost to cosine sim if passage title shares words with query
+  title_overlap_boost: 0.05
 
   # Batch size for cross-encoder inference
   batch_size: 32
@@ -119,9 +125,10 @@ generator:
   request_timeout: 600
   validate_citations: true
   retry_on_parse_failure: true
-  backend: "ollama"                        # "ollama" or "anthropic"
-  anthropic_model: "claude-haiku-4-5-20251001"  # Claude model (used when backend=anthropic)
-  specialist_mode: true                    # true: Haiku selects facts, Ollama answers
+  backend: "ollama"                            # "ollama" or "anthropic"
+  anthropic_model: "claude-sonnet-4-6"  # Claude model (used when backend=anthropic)
+  specialist_mode: true                      # true: Sonnet selects facts, Ollama answers
+  specialist_swap: true                      # true: SWAP roles — Ollama selects facts, Sonnet answers
 
 
 # --- Evaluation ---

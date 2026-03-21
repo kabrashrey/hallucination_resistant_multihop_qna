@@ -1,6 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional, Dict
-import re
+from typing import List, Dict
 
 from pipeline.data_loader import Passage, SupportingFact
 from pipeline.indexer import RetrievalResult
@@ -111,21 +110,11 @@ class PromptBuilder:
             relevance = max(0.0, min(1.0, result.score))  # Clamp to [0, 1]
             lines.append(f"Passage {passage_idx}: [{passage.title} (relevance: {relevance:.2f})]")
 
-            for sent_str in result.supporting_sentences:
-                sent_idx = self._find_sentence_index(passage.sentences, sent_str)
-                if sent_idx is not None:
-                    display_sent = sent_str[:120] + "..." if len(sent_str) > 120 else sent_str
-                    lines.append(f"  [{sent_idx}] {display_sent}")
+            for sent_str, sent_idx in zip(result.supporting_sentences, result.supporting_sentence_indices):
+                display_sent = sent_str[:200] + "..." if len(sent_str) > 200 else sent_str
+                lines.append(f"  [{sent_idx}] {display_sent}")
 
         return "\n".join(lines)
-
-    def _find_sentence_index(self, sentences: List[str], target: str) -> Optional[int]:
-        target_norm = " ".join(target.split())
-        for i, sent in enumerate(sentences):
-            sent_norm = " ".join(sent.split())
-            if sent_norm == target_norm or sent_norm.startswith(target_norm[:50]):
-                return i
-        return None
 
     def _compute_complexity_score(self, query: str, results: List[RerankResult]) -> float:
         score = 0.0
@@ -140,9 +129,15 @@ class PromptBuilder:
         score += self.cfg.complexity_keywords_weight * float(has_bridge_kw)
 
         # Factor 3: Confidence (how ambiguous is the retrieval?)
-        avg_confidence = sum(r.retrieval_score for r in results) / len(results) if results else 0.5
-        # Lower confidence = harder (invert the score)
-        confidence_penalty = 1.0 - min(avg_confidence, 1.0)
+        # Use reranker top-score gap as a better proxy than raw retrieval scores
+        if len(results) >= 2:
+            top = float(results[0].score)
+            second = float(results[1].score)
+            denom = abs(top) + 1e-6
+            gap = max(min((top - second) / denom, 1.0), 0.0)
+            confidence_penalty = 1.0 - gap
+        else:
+            confidence_penalty = 0.5
         score += self.cfg.complexity_confidence_weight * confidence_penalty
 
         # Factor 4: Supporting sentence count (many sentences = complex reasoning)
@@ -156,14 +151,10 @@ class PromptBuilder:
         fact_indices = {}
 
         for passage_idx, result in enumerate(results):
-            passage = result.passage
-            facts = []
-
-            for sent_str in result.supporting_sentences:
-                sent_idx = self._find_sentence_index(passage.sentences, sent_str)
-                if sent_idx is not None:
-                    facts.append((passage.title, sent_idx))
-
+            facts = [
+                (result.passage.title, sent_idx)
+                for sent_idx in result.supporting_sentence_indices
+            ]
             fact_indices[passage_idx] = facts
 
         return fact_indices
@@ -173,15 +164,13 @@ class PromptBuilder:
         fact_mapping = {}  # fact_number -> (title, sentence_idx)
         fact_number = 0
 
-        for _, result in enumerate(results):
+        for result in results:
             passage = result.passage
-            for sent_str in result.supporting_sentences:
-                sent_idx = self._find_sentence_index(passage.sentences, sent_str)
-                if sent_idx is not None:
-                    display_sent = sent_str[:100] + "..." if len(sent_str) > 100 else sent_str
-                    lines.append(f"Fact {fact_number}: [{passage.title}, {sent_idx}] {display_sent}")
-                    fact_mapping[fact_number] = (passage.title, sent_idx)
-                    fact_number += 1
+            for sent_str, sent_idx in zip(result.supporting_sentences, result.supporting_sentence_indices):
+                display_sent = sent_str[:200] + "..." if len(sent_str) > 200 else sent_str
+                lines.append(f"Fact {fact_number}: [{passage.title}, {sent_idx}] {display_sent}")
+                fact_mapping[fact_number] = (passage.title, sent_idx)
+                fact_number += 1
 
         return "\n".join(lines), fact_mapping
 
@@ -237,7 +226,14 @@ RULES:
   BAD: "The film was directed by Martin Scorsese" GOOD: "Martin Scorsese"
   BAD: "decisive defeat for Italy and secured Ethiopian sovereignty" GOOD: "Battle of Adwa"
 - For yes/no questions, answer "yes" or "no" (lowercase only).
-- You MUST attempt an answer if ANY facts are relevant. Only respond "Cannot determine from evidence" if the facts are completely unrelated to the question.
+- For "who/which is older/larger/first" questions, answer with the ENTITY NAME, not "yes" or "no".
+- Give exactly ONE answer — the single most specific entity. NEVER list multiple answers separated by commas.
+  BAD: "United States Ambassador, Chief of Protocol" GOOD: "Chief of Protocol"
+- Do NOT add parenthetical clarifications or alternative names.
+  BAD: "Kansas Song (We're From Kansas)" GOOD: "Kansas Song"
+  BAD: "3,677 seated (4,000 capacity)" GOOD: "3,677 seated"
+- You MUST provide an answer using the available facts. Even if you only have partial evidence, give your best logical guess.
+- NEVER output "Cannot determine from evidence", always make a prediction.
 """
         else:
             instructions = f"""Question: {query}

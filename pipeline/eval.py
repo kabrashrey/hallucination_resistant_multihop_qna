@@ -2,6 +2,7 @@
 import json
 import argparse
 import subprocess
+import concurrent.futures
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -21,20 +22,40 @@ log = get_logger("eval")
 def build_pipeline(cfg):
     log.info("Loading data...")
     loader = HotpotQALoader(cfg.data.dev_distractor)
-    examples = loader.load(limit=cfg.eval.limit)
+
+    # Load ALL examples to build a global index (covers all passages in dataset)
+    all_examples = loader.load(limit=None)
 
     seen = set()
-    passages = []
-    for ex in examples:
+    all_passages = []
+    for ex in all_examples:
         for ctx in ex.contexts:
             key = (ctx.title, ctx.text)
             if key not in seen:
                 seen.add(key)
-                passages.append(ctx)
+                all_passages.append(ctx)
 
-    log.info(f"Building retriever with {len(passages)} passages...")
+    # Slice out examples for LLM evaluation
+    if cfg.eval.limit:
+        eval_examples = all_examples[:cfg.eval.limit]
+        log.info(f"Sliced out {cfg.eval.limit} examples for LLM evaluation.")
+    else:
+        eval_examples = all_examples
+        log.info("No limit set, using all examples for LLM evaluation.")
+
+    log.info("Initializing retriever...")
     retriever = HybridRetriever.from_config(cfg)
-    retriever.index(passages, show_progress=False)
+
+    # Use global cache to avoid re-encoding on every run
+    cache_path = Path(f"{cfg.retriever.index_cache_dir}_global")
+    if cache_path.exists() and (cache_path / "faiss.index").exists():
+        log.info(f"Loading cached global index from {cache_path}...")
+        retriever.load(cache_path)
+    else:
+        log.info(f"Building global index with {len(all_passages)} passages...")
+        retriever.index(all_passages, show_progress=True)
+        log.info(f"Saving global index to {cache_path}...")
+        retriever.save(cache_path)
 
     log.info("Loading reranker...")
     reranker = Reranker.from_config(cfg)
@@ -45,7 +66,7 @@ def build_pipeline(cfg):
     log.info("Initializing generator...")
     gen = Generator.from_config(cfg)
 
-    return examples, retriever, reranker, pb, gen, cfg
+    return eval_examples, retriever, reranker, pb, gen, cfg
 
 
 def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[int] = None):
@@ -59,83 +80,100 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
 
     reranker_top_k = getattr(cfg.reranker, 'top_k', 7)
 
-    for ex in tqdm(examples, desc="Running pipeline"):
-        # Gold supporting facts for this example
-        gold_titles = {sf.title for sf in ex.supporting_facts}
-        gold_facts = {(sf.title, sf.sentence_index) for sf in ex.supporting_facts}
-
-        retrieved = retriever.retrieve_multihop(
-            ex.question, hops=2, top_k=20, question_type=ex.question_type
-        )
-
-        if not retrieved:
-            predictions[ex.id] = {
-                "answer": "Cannot answer based on the provided evidence.",
-                "sp": [],
-            }
-            for stage in diag:
-                diag[stage].append(0.0)
-            continue
-
-        # Diagnostic: retrieval recall (gold titles in retrieved candidates)
-        retrieved_titles = {r.passage.title for r in retrieved}
-        retrieval_recall = len(gold_titles & retrieved_titles) / len(gold_titles) if gold_titles else 0.0
-        diag["retrieval"].append(retrieval_recall)
-
-        reranked = reranker.rerank(ex.question, retrieved, top_k=reranker_top_k, select_sentences=True)
-
-        # Diagnostic: rerank recall (gold titles surviving reranker cut)
-        reranked_titles = {r.passage.title for r in reranked}
-        rerank_recall = len(gold_titles & reranked_titles) / len(gold_titles) if gold_titles else 0.0
-        diag["rerank"].append(rerank_recall)
-
-        # Diagnostic: sentence recall (gold (title, sent_idx) in selected sentences)
-        selected_facts = set()
-        for r in reranked:
-            for sent_str in r.supporting_sentences:
-                # Find sentence index in passage
-                for idx, s in enumerate(r.passage.sentences):
-                    if " ".join(s.split()) == " ".join(sent_str.split()) or " ".join(s.split()).startswith(" ".join(sent_str.split())[:50]):
-                        selected_facts.add((r.passage.title, idx))
-                        break
-        sentence_recall = len(gold_facts & selected_facts) / len(gold_facts) if gold_facts else 0.0
-        diag["sentence"].append(sentence_recall)
-
-        pb_output = pb.build(ex.question, reranked, use_citation_selection=True)
+    def process_example(ex):
+        """Process a single example through the full pipeline."""
         try:
-            gen_output = gen.generate(
-                prompt=pb_output.prompt,
-                target_model=pb_output.target_model,
-                temperature=(
-                    cfg.prompt_builder.temperature_large_model
-                    if pb_output.target_model == "complex"
-                    else cfg.prompt_builder.temperature_small_model
-                ),
-                supporting_fact_indices=pb_output.supporting_fact_indices,
-                fact_mapping=pb_output.fact_mapping,
+            # Gold supporting facts for this example
+            gold_titles = {sf.title for sf in ex.supporting_facts}
+            gold_facts = {(sf.title, sf.sentence_index) for sf in ex.supporting_facts}
+
+            retrieved = retriever.retrieve_multihop(
+                ex.question, hops=2, top_k=20, question_type=ex.question_type
             )
-            answer = gen_output.answer
-            supporting_facts = gen_output.supporting_facts
-            full_response = gen_output.full_response
-        except Exception as e:
-            log.warning(f"Generation failed for {ex.id}: {e}")
-            answer = "Cannot answer based on the provided evidence."
-            supporting_facts = []
+
+            if not retrieved:
+                return ex.id, {
+                    "answer": "Cannot answer based on the provided evidence.",
+                    "sp": [],
+                }, {"retrieval": 0.0, "rerank": 0.0, "sentence": 0.0, "prediction": 0.0}
+
+            # Diagnostic: retrieval recall
+            retrieved_titles = {r.passage.title for r in retrieved}
+            retrieval_recall = len(gold_titles & retrieved_titles) / len(gold_titles) if gold_titles else 0.0
+
+            reranked = reranker.rerank(ex.question, retrieved, top_k=reranker_top_k, select_sentences=True)
+
+            # Diagnostic: rerank recall
+            reranked_titles = {r.passage.title for r in reranked}
+            rerank_recall = len(gold_titles & reranked_titles) / len(gold_titles) if gold_titles else 0.0
+
+            # Diagnostic: sentence recall
+            selected_facts = set()
+            for r in reranked:
+                for sent_str in r.supporting_sentences:
+                    for idx, s in enumerate(r.passage.sentences):
+                        if " ".join(s.split()) == " ".join(sent_str.split()) or " ".join(s.split()).startswith(" ".join(sent_str.split())[:50]):
+                            selected_facts.add((r.passage.title, idx))
+                            break
+            sentence_recall = len(gold_facts & selected_facts) / len(gold_facts) if gold_facts else 0.0
+
+            pb_output = pb.build(ex.question, reranked, use_citation_selection=True)
             full_response = ""
+            try:
+                gen_output = gen.generate(
+                    prompt=pb_output.prompt,
+                    target_model=pb_output.target_model,
+                    temperature=(
+                        cfg.prompt_builder.temperature_large_model
+                        if pb_output.target_model == "complex"
+                        else cfg.prompt_builder.temperature_small_model
+                    ),
+                    supporting_fact_indices=pb_output.supporting_fact_indices,
+                    fact_mapping=pb_output.fact_mapping,
+                )
+                answer = gen_output.answer
+                supporting_facts = gen_output.supporting_facts
+                full_response = gen_output.full_response
+            except Exception as e:
+                log.warning(f"Generation failed for {ex.id}: {e}")
+                answer = "Cannot answer based on the provided evidence."
+                supporting_facts = []
 
-        # Diagnostic: prediction recall (gold facts in LLM output)
-        pred_facts = {(sf[0], sf[1]) for sf in supporting_facts} if supporting_facts else set()
-        pred_recall = len(gold_facts & pred_facts) / len(gold_facts) if gold_facts else 0.0
-        diag["prediction"].append(pred_recall)
+            # Diagnostic: prediction recall
+            pred_facts = {(sf[0], sf[1]) for sf in supporting_facts} if supporting_facts else set()
+            pred_recall = len(gold_facts & pred_facts) / len(gold_facts) if gold_facts else 0.0
 
-        #dict indexed by ID, no "id" field needed
-        predictions[ex.id] = {
-            "question": ex.question,
-            "gold_answer": ex.answer,
-            "answer": answer,
-            "sp": supporting_facts,  # List of [title, sentence_index]
-            "full_response": full_response,
-        }
+            return ex.id, {
+                "question": ex.question,
+                "gold_answer": ex.answer,
+                "answer": answer,
+                "sp": supporting_facts,
+                "full_response": full_response,
+            }, {
+                "retrieval": retrieval_recall,
+                "rerank": rerank_recall,
+                "sentence": sentence_recall,
+                "prediction": pred_recall,
+            }
+        except Exception as e:
+            log.error(f"Failed processing example {ex.id}: {e}")
+            return ex.id, {
+                "answer": "Error occurred during processing.",
+                "sp": [],
+            }, {"retrieval": 0.0, "rerank": 0.0, "sentence": 0.0, "prediction": 0.0}
+
+    # Parallel execution — 5 workers (Anthropic API is network-bound, Ollama handles ~4 concurrent on RTX 4060)
+    max_workers = 5
+    log.info(f"Running pipeline with {max_workers} parallel workers...")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_ex = {executor.submit(process_example, ex): ex for ex in examples}
+
+        for future in tqdm(concurrent.futures.as_completed(future_to_ex), total=len(examples), desc="Running pipeline"):
+            ex_id, pred, ex_diag = future.result()
+            predictions[ex_id] = pred
+            for stage in diag:
+                diag[stage].append(ex_diag[stage])
 
     # Summary stats
     empty_sp = sum(1 for p in predictions.values() if not p["sp"])

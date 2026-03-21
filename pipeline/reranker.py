@@ -1,4 +1,5 @@
 import os
+import re
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ class RerankResult:
     retrieval_rank: int                       
     retrieval_score: float                    
     supporting_sentences: List[str] = field(default_factory=list)
+    supporting_sentence_indices: List[int] = field(default_factory=list)
     sentence_scores: List[float] = field(default_factory=list)
     hop: int = 0
 
@@ -36,6 +38,8 @@ class Reranker:
         sentence_score_threshold: float = 0.4,
         max_sentences_per_passage: int = 3,
         batch_size: int = 32,
+        sentence_passage_limit: int = 3,
+        title_overlap_boost: float = 0.05,
     ):
         self.model_name = model_name
         self.sentence_model_name = sentence_model_name
@@ -43,6 +47,8 @@ class Reranker:
         self.sentence_score_threshold = sentence_score_threshold
         self.max_sentences_per_passage = max_sentences_per_passage
         self.batch_size = batch_size
+        self.sentence_passage_limit = sentence_passage_limit
+        self.title_overlap_boost = title_overlap_boost
 
         log.info(f"Loading cross-encoder: {model_name}")
         self._cross_encoder = CrossEncoder(model_name, device=device)
@@ -71,6 +77,8 @@ class Reranker:
             sentence_score_threshold=r.sentence_score_threshold,
             max_sentences_per_passage=r.max_sentences_per_passage,
             batch_size=r.batch_size,
+            sentence_passage_limit=getattr(r, "sentence_passage_limit", 3),
+            title_overlap_boost=getattr(r, "title_overlap_boost", 0.05),
         )
 
     def rerank(
@@ -115,28 +123,52 @@ class Reranker:
 
         return results
 
+    def _normalize_tokens(self, text: str) -> set:
+        """Normalize text to lowercase alphanumeric tokens for robust matching."""
+        return {
+            re.sub(r"[^a-z0-9]+", "", t.lower())
+            for t in text.split()
+            if re.sub(r"[^a-z0-9]+", "", t.lower())
+        }
+
     def _select_supporting_sentences(
         self, query: str, results: List[RerankResult]
     ) -> None:
+        # Only select sentences from top N reranked passages (saves embedding calls)
+        active_results = results[:self.sentence_passage_limit]
+
         passage_sentence_ranges: List[Tuple[int, int]] = []
         all_sentences: List[str] = []
 
-        for r in results:
+        # Track mapping from flat index back to original sentence index in passage
+        orig_indices_map: List[List[int]] = []  # per-passage: list of original indices for non-empty sentences
+
+        for r in active_results:
             start = len(all_sentences)
-            sents = [s.strip() for s in r.passage.sentences if s.strip()]
-            all_sentences.extend(sents)
-            passage_sentence_ranges.append((start, start + len(sents)))
+            orig_indices = []
+            for orig_idx, s in enumerate(r.passage.sentences):
+                stripped = s.strip()
+                if stripped:
+                    all_sentences.append(stripped)
+                    orig_indices.append(orig_idx)
+            passage_sentence_ranges.append((start, start + len(orig_indices)))
+            orig_indices_map.append(orig_indices)
 
         if not all_sentences:
+            for r in results:
+                r.supporting_sentence_indices = []
+                r.supporting_sentences = []
+                r.sentence_scores = []
             return
 
-        query_vec: np.ndarray = self._sentence_encoder.encode_query(query)  
+        query_vec: np.ndarray = self._sentence_encoder.encode_query(query)
         sent_vecs: np.ndarray = self._sentence_encoder.encode(all_sentences)
 
         # Cosine similarity = dot product on unit vectors
         sim_scores: np.ndarray = sent_vecs @ query_vec  # shape: (n_sentences,)
 
-        for r, (start, end) in zip(results, passage_sentence_ranges):
+        query_words = self._normalize_tokens(query)
+        for r_idx, (r, (start, end), orig_indices) in enumerate(zip(active_results, passage_sentence_ranges, orig_indices_map)):
             if end <= start:
                 continue
 
@@ -144,14 +176,13 @@ class Reranker:
             scores = sim_scores[start:end].tolist()
 
             # Title-match boost: if passage title words overlap with query, boost all sentence scores
-            title_words = {w.lower() for w in r.passage.title.split() if len(w) > 2}
-            query_words = {w.lower() for w in query.split()}
+            title_words = self._normalize_tokens(r.passage.title)
             if title_words & query_words:
-                scores = [s + 0.05 for s in scores]
+                scores = [s + self.title_overlap_boost for s in scores]
 
-            paired = sorted(zip(scores, sents), reverse=True)
-            selected_sents = []
-            selected_scores = []
+            # Zip scores, sentences, and original indices together, sort by score descending
+            paired = sorted(zip(scores, sents, orig_indices), reverse=True)
+            selected: List[Tuple[float, str, int]] = []
 
             # Rank-aware guaranteed minimum: top passages get more sentences
             if r.rank <= 1:
@@ -161,18 +192,26 @@ class Reranker:
             else:
                 min_guarantee = 2  # Lower passages: guarantee 2
 
-            for i, (score, sent) in enumerate(paired):
+            for i, (score, sent, orig_idx) in enumerate(paired):
                 if i < min_guarantee:
-                    selected_sents.append(sent)
-                    selected_scores.append(round(float(score), 4))
-                elif score >= self.sentence_score_threshold and len(selected_sents) < self.max_sentences_per_passage:
-                    selected_sents.append(sent)
-                    selected_scores.append(round(float(score), 4))
+                    selected.append((score, sent, orig_idx))
+                elif score >= self.sentence_score_threshold and len(selected) < self.max_sentences_per_passage:
+                    selected.append((score, sent, orig_idx))
                 else:
                     break  # Sorted descending — all remaining are below threshold
 
-            r.supporting_sentences = selected_sents
-            r.sentence_scores = selected_scores
+            # Sort selected sentences chronologically (by original index) for coherent reading
+            selected.sort(key=lambda x: x[2])
+
+            r.supporting_sentences = [s[1] for s in selected]
+            r.supporting_sentence_indices = [s[2] for s in selected]
+            r.sentence_scores = [round(float(s[0]), 4) for s in selected]
+
+        # Clear sentence fields for lower-ranked passages we skipped
+        for r in results[self.sentence_passage_limit:]:
+            r.supporting_sentence_indices = []
+            r.supporting_sentences = []
+            r.sentence_scores = []
 
     def __repr__(self) -> str:
         return (

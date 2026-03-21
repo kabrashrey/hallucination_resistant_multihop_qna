@@ -55,7 +55,7 @@ class OllamaEmbedder:
         payload = {"model": self.model, "input": texts}
 
         try:
-            resp = requests.post(url, json=payload, timeout=120)
+            resp = requests.post(url, json=payload, timeout=300)
             resp.raise_for_status()
         except requests.ConnectionError as e:
             raise RuntimeError(f"Ollama not reachable at {url}") from e

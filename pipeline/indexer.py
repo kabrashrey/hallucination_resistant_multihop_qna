@@ -566,7 +566,7 @@ class HybridRetriever:
                         "stream": False,
                         "temperature": 0.0,
                     },
-                    timeout=30,
+                    timeout=300,
                 )
                 resp.raise_for_status()
                 text = resp.json().get("response", "")
