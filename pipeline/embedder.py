@@ -52,10 +52,14 @@ class OllamaEmbedder:
 
     def _embed_batch(self, texts: List[str]) -> np.ndarray:
         url = f"{self.base_url}/api/embed"
-        payload = {"model": self.model, "input": texts}
+        payload = {
+            "model": self.model, 
+            "input": texts,
+            "keep_alive": -1
+            }
 
         try:
-            resp = requests.post(url, json=payload, timeout=300)
+            resp = requests.post(url, json=payload, timeout=120)
             resp.raise_for_status()
         except requests.ConnectionError as e:
             raise RuntimeError(f"Ollama not reachable at {url}") from e

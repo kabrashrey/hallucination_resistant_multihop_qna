@@ -206,6 +206,7 @@ class HybridRetriever:
         self,
         embed_model: str = "nomic-embed-text",
         ollama_base_url: str = "http://localhost:11434",
+        extraction_model: str = "qwen3:8b",
         alpha: float = 0.7,
         alpha_bridge: Optional[float] = None,
         alpha_comparison: Optional[float] = None,
@@ -213,12 +214,22 @@ class HybridRetriever:
         candidate_pool_size: int = 100,
         device: str = "cpu",   # kept for API compat, unused (Ollama handles device)
         batch_size: int = 64,
+        prompts=None,
+        max_bridge_entities: int = 3,
+        extraction_temperature: float = 0.0,
+        extraction_timeout: int = 120,
     ):
+        self.extraction_model = extraction_model
+        self.ollama_base_url = ollama_base_url
         self.alpha = alpha
         self.alpha_bridge = alpha_bridge
         self.alpha_comparison = alpha_comparison
         self.rrf_k = rrf_k
         self.candidate_pool_size = candidate_pool_size
+        self.prompts = prompts
+        self.max_bridge_entities = max_bridge_entities
+        self.extraction_temperature = extraction_temperature
+        self.extraction_timeout = extraction_timeout
 
         self.bm25 = BM25Retriever()
         self.dense = DenseRetriever(
@@ -290,7 +301,7 @@ class HybridRetriever:
             self._passages = [Passage(title="", sentences=[str(p)]) for p in passages]
             self._texts = [str(p) for p in passages]
 
-        log.info(f"Indexing {len(self._texts)} passages...")
+        log.info(f"\nIndexing {len(self._texts)} passages...")
 
         # Build both indices
         log.step("Building BM25 index...")
@@ -588,20 +599,27 @@ class HybridRetriever:
                           top_k_per_hop: int = 5,
                           question_type: Optional[str] = None) -> List[RetrievalResult]:
         """
-        Multi-hop iterative retrieval for bridge questions.
+        Multi-hop iterative retrieval for bridge questions
 
-        Hop-2 strategies (configured via hop2_strategy):
-          "title" (B): separate retrieval per bridge entity title
-          "concat" (legacy): append entities to original query
-          "both" (B+D): title queries + LLM decomposition when confidence is low
+        How it works:
+          Hop 1: retrieve using the original question
+          Hop 2: extract named entities from hop 1 passages (not just titles!)
+                 reformulate query = question + bridge entities, retrieve again
+          Finally: merge, deduplicate, re-rank results from all hops
 
         query: the original question
-        hops: number of retrieval iterations (default 2)
+        hops: number of retrieval iterations (default 2 for bridge questions)
         top_k: total results to return after merging
-        top_k_per_hop: passages retrieved per hop
+        top_k_per_hop: how many passages to retrieve at each hop
         question_type: "bridge" or "comparison"
 
         Returns: deduplicated, re-ranked RetrievalResult list
+
+        Eg for "What position was held by the woman who portrayed Corliss Archer?":
+          Hop 1 query: "What position was held by the woman who portrayed Corliss Archer?"
+          Hop 1 finds: "Kiss and Tell" passage --> mentions "Shirley Temple"
+          Hop 2 query: "What position was held by the woman who portrayed Corliss Archer? Shirley Temple"
+          Hop 2 finds: "Shirley Temple" passage --> mentions "Chief of Protocol"
         """
         all_results: List[RetrievalResult] = []
         seen_keys: set = set()
@@ -682,6 +700,8 @@ class HybridRetriever:
 
         # Re-rank and return
         all_results.sort(key=lambda r: r.score, reverse=True)
+
+        # Re-assign ranks (keep per-hop confidence as-is)
         for i, r in enumerate(all_results):
             r.rank = i
 
@@ -710,52 +730,3 @@ class HybridRetriever:
                 f"passages={len(self._passages)})")
 
 
-if __name__ == "__main__":
-    from pipeline.data_loader import HotpotQALoader
-    cfg = load_config()
-
-    # Load data using config
-    loader = HotpotQALoader(cfg.data.dev_distractor)
-    examples = loader.load(limit=50)
-
-    # Collect unique passages
-    seen = set()
-    passages: List[Passage] = []
-    for ex in examples:
-        for ctx in ex.contexts:
-            key = (ctx.title, ctx.text)
-            if key not in seen:
-                seen.add(key)
-                passages.append(ctx)
-
-    log.info(f"{len(passages)} unique passages from {len(examples)} examples")
-
-    # Build retriever from config
-    retriever = HybridRetriever.from_config(cfg)
-    retriever.index(passages)
-
-    # Save to disk
-    retriever.save(cfg.retriever.index_cache_dir)
-
-    # Load from disk
-    retriever2 = HybridRetriever.from_config(cfg)
-    retriever2.load(cfg.retriever.index_cache_dir)
-
-    # Test single-hop (comparison)
-    q1 = "Were Scott Derrickson and Ed Wood of the same nationality?"
-    log.info(f"Q (comparison): {q1}")
-    results = retriever2.retrieve(q1, top_k=cfg.retriever.top_k, question_type="comparison")
-    for r in results[:3]:
-        conf_str = f" conf={r.confidence:.2f}" if r.confidence > 0 else ""
-        log.info(f"[{r.rank}] score={r.score:.4f}{conf_str} title={r.passage.title}")
-
-    # Test multi-hop (bridge)
-    q2 = "What government position was held by the woman who portrayed Corliss Archer?"
-    log.info(f"Q (bridge, multi-hop): {q2}")
-    mh = cfg.retriever.multihop
-    results = retriever2.retrieve_multihop(q2, hops=mh.hops, top_k=5,
-                                           top_k_per_hop=mh.top_k_per_hop,
-                                           question_type="bridge")
-    for r in results:
-        conf_str = f" conf={r.confidence:.2f}" if r.confidence > 0 else ""
-        log.info(f"[{r.rank}] hop={r.hop} score={r.score:.4f}{conf_str} title={r.passage.title}")

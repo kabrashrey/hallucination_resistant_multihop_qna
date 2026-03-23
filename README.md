@@ -7,10 +7,11 @@ Evidence-based RAG for Hallucination-Resistant Multi-Hop Q&A
 Large Language Models (LLMs) often produce hallucinations — factually incorrect or unsupported answers — especially for multi-hop question answering (QA) tasks that require reasoning across multiple documents.
 
 This project aims to build a hallucination-resistant QA pipeline for general-domain multi-hop questions by:
-Grounding answers in retrieved evidence
-Enforcing evidence-first reasoning
-Verifying factual consistency before generating final responses
-Avoiding unsupported generations
+
+- Grounding answers in retrieved evidence
+- Enforcing evidence-first reasoning
+- Verifying factual consistency before generating final responses
+- Avoiding unsupported generations
 
 We focus primarily on the HotpotQA dataset, which contains multi-hop questions with supporting fact annotations, and optionally explore BeerQA for harder multi-hop settings.
 
@@ -20,7 +21,8 @@ We focus primarily on the HotpotQA dataset, which contains multi-hop questions w
 .
 ├── README.md
 ├── configs/
-│   └── default.yaml          # Central YAML config (alpha, rrf_k, hops, paths, etc.)
+│   ├── default.yaml           # Central YAML config (alpha, rrf_k, hops, paths, etc.)
+│   └── prompts.yaml           # Centralized LLM prompts (system/user instructions)
 ├── data/
 │   ├── hotpot_dev_distractor_v1.json
 │   ├── hotpot_dev_fullwiki_v1.json
@@ -30,26 +32,33 @@ We focus primarily on the HotpotQA dataset, which contains multi-hop questions w
 │   └── baseline_training.ipynb
 ├── pipeline/
 │   ├── __init__.py
-│   ├── config.py              # Typed config loader (YAML → dataclasses)
 │   ├── data_loader.py         # HotpotQA parser with standardized dataclasses
 │   ├── indexer.py             # Hybrid multi-hop retriever (BM25 + FAISS)
-│   └── logger.py              # Colored terminal logger
+│   ├── reranker.py            # Re-ranker with sentence-level overlap boosting
+│   ├── prompt_builder.py      # Prompt construction and complexity routing
+│   └── generator.py           # Final LLM generation using Ollama
 ├── reports/
 ├── requirements.txt
 ├── results/                   # Predictions and evaluation outputs
 └── scripts/
-    └── hotpot_evaluate_v1.py  # Official HotpotQA evaluation script
+    ├── __init__.py
+    ├── config.py              # Typed config loader (YAML → dataclasses)
+    ├── analyze_predictions.py # Analysis tools for errors / SP EM scores
+    ├── test_pipeline.py       # Unified fast test script for the pipeline
+    ├── hotpot_evaluate_v1.py  # Official HotpotQA evaluation script
+    └── logger.py              # Colored terminal logger
 ```
 
 ## Setup
 
-1. Clone the repo:
+1. **Clone the repo:**
 
    ```bash
    git clone https://github.com/kabrashrey/hallucination_resistant_multihop_qna.git
+   cd hallucination_resistant_multihop_qna
    ```
 
-2. Create and activate a virtual environment:
+2. **Create and activate a virtual environment:**
 
    Using **venv**:
 
@@ -65,132 +74,80 @@ We focus primarily on the HotpotQA dataset, which contains multi-hop questions w
    conda activate rag_multihop
    ```
 
-3. Install dependencies:
+3. **Install dependencies:**
+
    ```bash
    pip install -r requirements.txt
    ```
 
-## Pipeline Modules
+4. **Setup Ollama Models:**
+   The pipeline assumes a local Ollama instance running. Fetch the required models:
+   ```bash
+   ollama pull nomic-embed-text
+   ollama pull llama3.2:1b
+   ollama pull qwen3:8b
+   ```
 
-### `pipeline/data_loader.py` — Data Loading
+## Pipeline Architecture
 
-Parses HotpotQA JSON into standardized dataclasses (`Passage`, `SupportingFact`, `HotpotQAExample`).
+The pipeline uses a multi-stage process with local, open-source models (via Ollama) and relies on GPU acceleration where available.
 
-```python
-from pipeline.data_loader import HotpotQALoader
+### 1. Data Loading & Sub-sampling
 
-loader = HotpotQALoader("data/hotpot_dev_distractor_v1.json")
-examples = loader.load(limit=100)
-passages = list(loader.build_passage_index().values())
-```
+`pipeline/data_loader.py` parses HotpotQA JSON into standardized dataclasses (`Passage`, `Context`, `HotpotQAExample`).
 
-```bash
-python -m pipeline.data_loader  data/hotpot_dev_distractor_v1.json 3
-```
+### 2. Hybrid Multi-Hop Retriever
 
-### `pipeline/indexer.py` — Hybrid Multi-Hop Retriever
+`pipeline/indexer.py` combines BM25 (sparse/keyword) and FAISS (dense/semantic) retrieval using Reciprocal Rank Fusion (RRF). Features multi-hop iterative query reformulation and per-question-type alpha dense weights.
 
-Combines BM25 (sparse, keyword) and FAISS (dense, semantic) retrieval with Reciprocal Rank Fusion (RRF).
+### 3. Sentence-level Reranker
 
-**Features:**
+`pipeline/reranker.py` reranks retrieved passages based on cross-encoder similarity with exact sentence attribution mapping to compute accurate HotpotQA Supporting Fact Exact Match (SP EM) metrics.
 
-- **Candidate-pool RRF** — only fuses top-N from each retriever, not the full corpus
-- **Per-type alpha** — different dense/BM25 weights for bridge vs comparison questions
-- **Multi-hop retrieval** — iterative query reformulation with bridge entity extraction
-- **Confidence signal** — per-hop score gap between #1 and #2
-- **Save/load** — persist FAISS + BM25 indices to disk, skip re-encoding
+### 4. Dynamic Prompt Routing
 
-```python
-from pipeline.indexer import HybridRetriever
+`pipeline/prompt_builder.py` builds the final LLM prompt context using an evidence-first approach, and assigns a complexity score to route queries to either a smaller or larger model.
 
-retriever = HybridRetriever.from_config()  # reads configs/default.yaml
-retriever.index(passages)
-retriever.save("index_cache")
+### 5. Final Generator
 
-# Single-hop
-results = retriever.retrieve("Who directed Doctor Strange?", top_k=5)
+`pipeline/generator.py` invokes Ollama endpoints seamlessly. Features a **Specialist Mode** and robust parsing mechanisms (via strict schema and timeout configurations).
 
-# Multi-hop (bridge questions)
-results = retriever.retrieve_multihop("What position was held by the woman who portrayed Corliss Archer?", hops=2, top_k=5, question_type="bridge")
-```
+## Usage & Testing
+
+We provide a consolidated end-to-end testing script `test_pipeline.py` which loads a few examples, tests the retrieval, routing, and generation mechanisms.
 
 ```bash
-python -m pipeline.indexer
-```
-
-### `pipeline/config.py` — Configuration
-
-All tunable parameters live in `configs/default.yaml`. Load with typed dataclasses:
-
-```python
-from pipeline.config import load_config
-
-cfg = load_config()                           # default config
-cfg = load_config("configs/experiment1.yaml") # custom config
-
-cfg.retriever.alpha           # 0.7
-cfg.retriever.alpha_bridge    # 0.85
-cfg.retriever.multihop.hops   # 2
-cfg.data.dev_distractor       # "data/hotpot_dev_distractor_v1.json"
-```
-
-### `pipeline/logger.py` — Colored Logger
-
-Colored terminal output (green info/success, red warning/error, yellow step, gray debug):
-
-```python
-from pipeline.logger import get_logger
-log = get_logger("my_module")
-
-log.info("Processing...")      # green
-log.success("Done!")           # green bold
-log.warning("Slow operation")  # red
-log.error("Failed!")           # red bold
+python -m scripts.test_pipeline
 ```
 
 ## Configurations
 
-All experiment parameters are in `configs/default.yaml`:
+All system parameters are driven by YAML configurations in `configs/`:
 
-| Parameter                          | Default          | Description                             |
-| ---------------------------------- | ---------------- | --------------------------------------- |
-| `retriever.alpha`                  | 0.7              | Dense weight (1-alpha = BM25 weight)    |
-| `retriever.alpha_bridge`           | 0.85             | Alpha for bridge questions              |
-| `retriever.alpha_comparison`       | 0.5              | Alpha for comparison questions          |
-| `retriever.rrf_k`                  | 20               | RRF smoothing constant                  |
-| `retriever.candidate_pool_size`    | 100              | Top-N from each retriever before fusion |
-| `retriever.embed_model`            | all-MiniLM-L6-v2 | SentenceTransformer model               |
-| `retriever.multihop.hops`          | 2                | Retrieval iterations                    |
-| `retriever.multihop.top_k_per_hop` | 5                | Passages per hop                        |
+- `default.yaml` - Pipeline logic, thresholds, timeouts, model endpoints, alpha scores.
+- `prompts.yaml` - Instruction strings for all stages of retrieval mapping (Standard, Citation, System, User, Specialist).
 
-## Data
+Example snippet:
 
-We use HotpotQA for multi-hop question answering.
+```python
+from scripts.config import load_config
 
-Available splits:
+cfg = load_config("configs/default.yaml")
 
-- `hotpot_dev_distractor_v1.json` — smaller candidate set (easier, 10 passages per question)
-- `hotpot_dev_fullwiki_v1.json` — full corpus retrieval (harder, realistic)
-- `hotpot_test_fullwiki_v1.json` — test set (no gold answers)
+print(cfg.retriever.alpha)             # 0.7
+print(cfg.generator.specialist_mode)   # Feature flag
+print(cfg.prompts.generator_specialist) # Pull from prompts.yaml
+```
 
-Two evaluation settings:
+## Data & Evaluation
 
-- **Distractor Setting** — 10 candidate passages per question
-- **FullWiki Setting** — requires retrieval from the full corpus
+We use **HotpotQA** for multi-hop question answering. Available splits include distractor settings and FullWiki evaluations.
+Metrics include macro-averages for Exact Match (EM), F1, Supporting Fact F1, and Joint F1.
 
-## Evaluation
-
-Metrics include:
-
-- Exact Match (EM)
-- F1
-- Supporting Fact EM / F1
-- Joint EM / F1
-
-Run evaluation:
+Run evaluation script using predictions generated by our pipeline:
 
 ```bash
-python scripts/hotpot_evaluate_v1.py results/predictions.json results/gold.json
+python scripts/hotpot_evaluate_v1.py results/gold.json results/predictions.json
 ```
 
 ## Team Members

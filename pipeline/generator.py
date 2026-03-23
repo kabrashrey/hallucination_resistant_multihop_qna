@@ -366,8 +366,8 @@ class Generator:
             "prompt": prompt,
             "stream": False,
             "temperature": temperature,
-            "options": {"num_ctx": 8192},
-            "keep_alive": -1,
+            "options": {"num_ctx": 4096},
+            "keep_alive": -1
         }
 
         try:
@@ -497,7 +497,7 @@ class Generator:
 
                 # Try to extract "supporting_fact_numbers" array
                 facts_match = re.search(
-                    r'"supporting_fact_numbers"\s*:\s*\[([^\]]*)\]', clean_text
+                    r'"supporting_fact(?:s|_numbers?)"\s*:\s*\[([^\]]*)\]', clean_text
                 )
                 if facts_match and fact_mapping:
                     nums_str = facts_match.group(1)
@@ -713,71 +713,3 @@ class Generator:
             f"validate_citations={self.validate_citations})"
         )
 
-if __name__ == "__main__":
-    from pipeline.data_loader import HotpotQALoader
-    from pipeline.indexer import HybridRetriever
-    from pipeline.prompt_builder import PromptBuilder
-    from pipeline.reranker import Reranker
-    from scripts.config import load_config
-
-    cfg = load_config()
-    loader = HotpotQALoader(cfg.data.dev_distractor)
-    examples = loader.load(limit=50)
-
-    seen = set()
-    passages = []
-    for ex in examples:
-        for ctx in ex.contexts:
-            key = (ctx.title, ctx.text)
-            if key not in seen:
-                seen.add(key)
-                passages.append(ctx)
-
-    log.info(f"Building retriever with {len(passages)} passages...")
-    retriever = HybridRetriever.from_config(cfg)
-    retriever.index(passages, show_progress=False)
-
-    log.info("Loading reranker...")
-    reranker = Reranker.from_config(cfg)
-
-    log.info("Initializing prompt builder...")
-    pb = PromptBuilder.from_config(cfg)
-
-    log.info("Initializing generator...")
-    gen = Generator.from_config(cfg)
-
-    for i, ex in enumerate(examples[:3]):
-        log.info(f"\n{'='*80}")
-        log.info(f"Example {i}: {ex.id}")
-        log.info(f"Question: {ex.question}")
-        log.info(f"Gold answer: {ex.answer}")
-
-        retrieved = retriever.retrieve_multihop(
-            ex.question, hops=2, top_k=20, question_type=ex.question_type
-        )
-        log.info(f"Retrieved {len(retrieved)} candidates")
-
-        reranked = reranker.rerank(ex.question, retrieved, top_k=5)
-        log.info(f"Re-ranked to {len(reranked)} passages")
-
-        pb_output = pb.build(ex.question, reranked)
-        log.info(f"Complexity score: {pb_output.complexity_score:.3f}")
-        log.info(f"Target model: {pb_output.target_model}")
-
-        gen_output = gen.generate(
-            prompt=pb_output.prompt,
-            target_model=pb_output.target_model,
-            temperature=(
-                cfg.prompt_builder.temperature_large_model
-                if pb_output.target_model == "complex"
-                else cfg.prompt_builder.temperature_small_model
-            ),
-            supporting_fact_indices=pb_output.supporting_fact_indices,
-        )
-
-        log.info(f"\n{'='*80}")
-        log.info(f"Generated answer: {gen_output.answer}")
-        log.info(f"Supporting facts: {gen_output.supporting_facts}")
-        log.info(f"Model: {gen_output.model_used}")
-        log.info(f"Generation time: {gen_output.generation_time:.2f}s")
-        log.info(f"\n{'='*80}")

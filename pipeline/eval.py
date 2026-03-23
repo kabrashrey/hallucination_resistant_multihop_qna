@@ -23,9 +23,10 @@ def build_pipeline(cfg):
     log.info("Loading data...")
     loader = HotpotQALoader(cfg.data.dev_distractor)
 
-    # Load ALL examples to build a global index (covers all passages in dataset)
+    # Load ALL examples to build the global index database
     all_examples = loader.load(limit=None)
 
+    # Collect unique passages from the loaded examples
     seen = set()
     all_passages = []
     for ex in all_examples:
@@ -35,24 +36,24 @@ def build_pipeline(cfg):
                 seen.add(key)
                 all_passages.append(ctx)
 
-    # Slice out examples for LLM evaluation
+    # Slice out examples for limit evaluation
     if cfg.eval.limit:
         eval_examples = all_examples[:cfg.eval.limit]
         log.info(f"Sliced out {cfg.eval.limit} examples for LLM evaluation.")
-    else:
+    else:   
         eval_examples = all_examples
         log.info("No limit set, using all examples for LLM evaluation.")
-
+    
     log.info("Initializing retriever...")
     retriever = HybridRetriever.from_config(cfg)
 
-    # Use global cache to avoid re-encoding on every run
     cache_path = Path(f"{cfg.retriever.index_cache_dir}_global")
+
     if cache_path.exists() and (cache_path / "faiss.index").exists():
         log.info(f"Loading cached global index from {cache_path}...")
         retriever.load(cache_path)
     else:
-        log.info(f"Building global index with {len(all_passages)} passages...")
+        log.info(f"Building global retriever with index {len(all_passages)} passages...")
         retriever.index(all_passages, show_progress=True)
         log.info(f"Saving global index to {cache_path}...")
         retriever.save(cache_path)
@@ -81,7 +82,6 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
     reranker_top_k = getattr(cfg.reranker, 'top_k', 7)
 
     def process_example(ex):
-        """Process a single example through the full pipeline."""
         try:
             # Gold supporting facts for this example
             gold_titles = {sf.title for sf in ex.supporting_facts}
@@ -153,7 +153,7 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
                 "retrieval": retrieval_recall,
                 "rerank": rerank_recall,
                 "sentence": sentence_recall,
-                "prediction": pred_recall,
+                "prediction": pred_recall
             }
         except Exception as e:
             log.error(f"Failed processing example {ex.id}: {e}")
@@ -162,13 +162,14 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
                 "sp": [],
             }, {"retrieval": 0.0, "rerank": 0.0, "sentence": 0.0, "prediction": 0.0}
 
-    # Parallel execution — 5 workers (Anthropic API is network-bound, Ollama handles ~4 concurrent on RTX 4060)
-    max_workers = 5
-    log.info(f"Running pipeline with {max_workers} parallel workers...")
-
+    max_workers = 3
+    log.info(f"Running pipeline with exactly {max_workers} parallel workers to respect OLLAMA_NUM_PARALLEL constraints...")
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
         future_to_ex = {executor.submit(process_example, ex): ex for ex in examples}
-
+        
+        # Gather results with progress bar
         for future in tqdm(concurrent.futures.as_completed(future_to_ex), total=len(examples), desc="Running pipeline"):
             ex_id, pred, ex_diag = future.result()
             predictions[ex_id] = pred
