@@ -55,9 +55,9 @@ retriever:
     max_bridge_entities: 5 # max entities extracted per hop for query reformulation (raised from 3)
     hop2_strategy: "both"                          # "title" (B), "concat" (legacy), "both" (B+D)
     llm_decompose_confidence_threshold: 0.3        # trigger LLM decomposition below this hop-1 confidence
-    llm_decompose_backend: "ollama"                 # "anthropic" or "ollama"
-    llm_decompose_model: "claude-haiku-4-5-20251001"
     llm_decompose_ollama_model: "qwen2.5:7b"
+    extraction_temperature: 0.0                     # LLM temperature for bridge entity extraction
+    extraction_timeout: 120                         # timeout for local LLM during entity extraction
 
   # --- Persistence ---
   index_cache_dir: "index_cache"
@@ -125,10 +125,7 @@ generator:
   request_timeout: 600
   validate_citations: true
   retry_on_parse_failure: true
-  backend: "ollama"                            # "ollama" or "anthropic"
-  anthropic_model: "claude-sonnet-4-6"  # Claude model (used when backend=anthropic)
-  specialist_mode: true                      # true: Sonnet selects facts, Ollama answers
-  specialist_swap: true                      # true: SWAP roles — Ollama selects facts, Sonnet answers
+  specialist_mode: false                     # true: model_large selects facts, model_small answers
 
 
 # --- Evaluation ---

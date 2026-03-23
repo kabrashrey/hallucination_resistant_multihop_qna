@@ -21,6 +21,11 @@ class MultihopConfig:
     hops: int = 2
     top_k_per_hop: int = 5
     max_bridge_entities: int = 3
+    hop2_strategy: str = "both"                          # "title" | "concat" | "both"
+    llm_decompose_confidence_threshold: float = 0.3      # trigger LLM decomposition below this
+    llm_decompose_ollama_model: str = "qwen2.5:7b"
+    extraction_temperature: float = 0.0                  # LLM temperature for bridge entity extraction
+    extraction_timeout: int = 120                        # timeout for local LLM during entity extraction
 
 
 @dataclass
@@ -45,9 +50,11 @@ class RerankerConfig:
     sentence_model_name: str = "nomic-embed-text"
     device: str = "cpu"
     top_k: int = 5                        
-    sentence_score_threshold: float = 0.4 
-    max_sentences_per_passage: int = 5    
+    sentence_score_threshold: float = 0.4
+    max_sentences_per_passage: int = 5
     batch_size: int = 32
+    sentence_passage_limit: int = 3
+    title_overlap_boost: float = 0.05
 
 
 @dataclass
@@ -78,6 +85,7 @@ class GeneratorConfig:
     request_timeout: int = 300
     validate_citations: bool = True
     retry_on_parse_failure: bool = True
+    specialist_mode: bool = False                       # True: model_large (SP) + model_small (answer)
 
 
 @dataclass

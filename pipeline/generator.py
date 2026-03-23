@@ -6,12 +6,6 @@ from typing import List, Dict, Optional
 
 import requests
 
-try:
-    import anthropic
-    HAS_ANTHROPIC = True
-except ImportError:
-    HAS_ANTHROPIC = False
-
 from scripts.config import load_config
 from scripts.logger import get_logger
 
@@ -20,11 +14,11 @@ log = get_logger("generator")
 
 @dataclass
 class GeneratorOutput:
-    answer: str                        
-    supporting_facts: List[List[str]]  
-    full_response: str                 
-    model_used: str                    
-    generation_time: float             
+    answer: str
+    supporting_facts: List[List[str]]
+    full_response: str
+    model_used: str
+    generation_time: float
 
 class Generator:
     def __init__(
@@ -35,10 +29,8 @@ class Generator:
         request_timeout: int = 120,
         validate_citations: bool = True,
         retry_on_parse_failure: bool = True,
-        backend: str = "ollama",
-        anthropic_model: str = "claude-haiku-4-5-20251001",
         specialist_mode: bool = False,
-        specialist_swap: bool = False,
+        prompts=None,
     ):
         self.ollama_base_url = ollama_base_url
         self.model_small = model_small
@@ -46,25 +38,13 @@ class Generator:
         self.request_timeout = request_timeout
         self.validate_citations = validate_citations
         self.retry_on_parse_failure = retry_on_parse_failure
-        self.backend = backend
-        self.anthropic_model = anthropic_model
         self.specialist_mode = specialist_mode
-        self.specialist_swap = specialist_swap
+        self.prompts = prompts
         self.session = requests.Session()  # Connection pooling
 
-        if self.backend == "anthropic" or self.specialist_mode:
-            if not HAS_ANTHROPIC:
-                raise ImportError("anthropic package not installed. Run: pip install anthropic")
-            self._anthropic_client = anthropic.Anthropic()
-            if self.specialist_mode:
-                if self.specialist_swap:
-                    log.success(f"Generator ready. Specialist SWAPPED: Ollama (SP) + {anthropic_model} (answer)")
-                else:
-                    log.success(f"Generator ready. Specialist mode: {anthropic_model} (SP) + Ollama (answer)")
-            else:
-                log.success(f"Generator ready. Backend: Anthropic ({anthropic_model})")
+        if self.specialist_mode:
+            log.success(f"Generator ready. Specialist mode: {self.model_large} (SP) + {self.model_small} (answer)")
         else:
-            self._anthropic_client = None
             log.success(f"Generator ready. Backend: Ollama at {ollama_base_url}")
 
     @classmethod
@@ -79,10 +59,8 @@ class Generator:
             request_timeout=g.request_timeout,
             validate_citations=g.validate_citations,
             retry_on_parse_failure=getattr(g, 'retry_on_parse_failure', True),
-            backend=getattr(g, 'backend', 'ollama'),
-            anthropic_model=getattr(g, 'anthropic_model', 'claude-haiku-4-5-20251001'),
             specialist_mode=getattr(g, 'specialist_mode', False),
-            specialist_swap=getattr(g, 'specialist_swap', False),
+            prompts=getattr(cfg, "prompts", None),
         )
 
     def generate(
@@ -93,16 +71,14 @@ class Generator:
         supporting_fact_indices: Optional[Dict] = None,
         fact_mapping: Optional[Dict] = None,
     ) -> GeneratorOutput:
-        # Specialist mode: Haiku selects facts, Ollama generates answer
+        # Specialist mode: Large Model selects facts, Small Model generates answer
         if self.specialist_mode and fact_mapping:
             return self._generate_specialist(
                 prompt, target_model, temperature,
                 supporting_fact_indices, fact_mapping,
             )
 
-        if self.backend == "anthropic":
-            model_name = self.anthropic_model
-        elif target_model == "complex":
+        if target_model == "complex":
             model_name = self.model_large
         else:
             model_name = self.model_small
@@ -140,130 +116,90 @@ class Generator:
         fact_mapping: Dict,
     ) -> GeneratorOutput:
         """
-        Specialist mode: two-call pipeline.
-        Default (specialist_swap=false): Sonnet selects facts, Ollama answers.
-        Swapped (specialist_swap=true):  Ollama selects facts, Sonnet answers.
+        Specialist mode: two-call pipeline (all local).
+        Call 1 (model_large): select supporting fact numbers from the full prompt.
+        Call 2 (model_small): answer the question using only the selected facts.
         """
         start_time = time.time()
-        swapped = getattr(self, 'specialist_swap', False)
-        ollama_model = self.model_small
 
-        # --- Call 1: SP model selects supporting facts + reasons ---
-        if swapped:
-            sp_model_label = ollama_model
-            log.info(f"Specialist (swapped): {sp_model_label} selecting facts...")
-            sp_response = self._call_ollama(prompt, ollama_model, temperature=0.1)
-        else:
-            sp_model_label = self.anthropic_model
-            log.info(f"Specialist: {sp_model_label} selecting facts...")
-            sp_response = self._call_anthropic(prompt, self.anthropic_model, temperature=0.1)
-
-        # Parse SP model's FULL output: answer, reasoning, AND supporting facts
-        sp_answer = ""
-        sp_reasoning = ""
-        supporting_facts = []
-        try:
-            clean_sp = re.sub(r'```json\s*', '', sp_response)
-            clean_sp = re.sub(r'```\s*', '', clean_sp)
-            # Strip reasoning model think tags (e.g., deepseek-r1)
-            clean_sp = re.sub(r'<think>.*?</think>', '', clean_sp, flags=re.DOTALL).strip()
-            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', clean_sp, re.DOTALL)
-            if json_match:
-                parsed = json.loads(json_match.group(0))
-                sp_answer = parsed.get("answer", "").strip()
-                sp_reasoning = parsed.get("reasoning", "").strip()
-                fact_numbers = parsed.get("supporting_fact_numbers", [])
-                for fn in fact_numbers:
-                    fn = int(fn)
-                    if fn in fact_mapping:
-                        title, idx = fact_mapping[fn]
-                        supporting_facts.append([title, int(idx)])
-        except Exception as e:
-            log.debug(f"Specialist SP JSON parse failed: {e}")
+        # --- Call 1: Large model selects supporting facts ---
+        log.info(f"Specialist mode: {self.model_large} selecting facts...")
+        sp_response = self._call_ollama(prompt, self.model_large, temperature=0.1)
+        _, supporting_facts = self._parse_output(sp_response, supporting_fact_indices, fact_mapping)
 
         if not supporting_facts:
-            # Fallback: use the general parser
-            sp_backend_model = ollama_model if swapped else self.anthropic_model
-            _, supporting_facts = self._parse_output(sp_response, supporting_fact_indices, fact_mapping)
-            if not supporting_facts:
-                repaired_answer, repaired_facts = self._repair_json(
-                    sp_response, sp_backend_model, fact_mapping, supporting_fact_indices
-                )
-                if repaired_facts:
-                    supporting_facts = repaired_facts
+            # Retry parse
+            repaired_answer, repaired_facts = self._repair_json(
+                sp_response, self.model_large, fact_mapping, supporting_fact_indices
+            )
+            if repaired_facts:
+                supporting_facts = repaired_facts
 
-        # Build selected fact numbers list (for the hint)
+        # --- Build a focused answer prompt with only selected facts ---
         selected_fact_nums = []
         for sf in supporting_facts:
             for num, (title, idx) in fact_mapping.items():
-                if sf[0] == title and sf[1] == idx:
+                if sf[0] == title and int(sf[1]) == int(idx):
                     selected_fact_nums.append(num)
                     break
 
-        log.info(f"Specialist: {sp_model_label} selected {len(supporting_facts)} facts: {selected_fact_nums}")
-        if sp_reasoning:
-            log.info(f"Specialist: reasoning: {sp_reasoning[:120]}...")
-
-        # --- Extract question and FULL facts block from the original prompt ---
+        # Extract the AVAILABLE FACTS and question from the original prompt
+        facts_lines = []
         question_line = ""
-        facts_block_lines = []
         for line in prompt.split("\n"):
-            if line.startswith("QUESTION:"):
+            if line.startswith("Fact "):
+                # Include only facts selected by large model, or all if none selected
+                if not selected_fact_nums:
+                    facts_lines.append(line)
+                else:
+                    for num in selected_fact_nums:
+                        if line.startswith(f"Fact {num}:"):
+                            facts_lines.append(line)
+                            break
+            elif line.startswith("QUESTION:"):
                 question_line = line
-            elif line.startswith("AVAILABLE FACTS:") or line.startswith("Fact "):
-                facts_block_lines.append(line)
 
         if not question_line:
+            # Fallback: extract question from prompt
             for line in prompt.split("\n"):
                 if "?" in line and not line.startswith("Fact") and not line.startswith("Example"):
                     question_line = f"QUESTION: {line.strip()}"
                     break
 
-        facts_block = "\n".join(facts_block_lines)
-
-        # --- Build answer prompt: ALL facts + SP model's reasoning as hint ---
-        hint = ""
-        if sp_reasoning:
-            hint = (
-                f"ANALYSIS (from a previous model):\n"
-                f"Reasoning: {sp_reasoning}\n"
-                f"Key facts identified: {selected_fact_nums}\n\n"
-            )
-        elif selected_fact_nums:
-            hint = f"HINT: Facts most relevant to the answer: {selected_fact_nums}\n\n"
-
-        answer_prompt = (
-            f"{question_line}\n\n"
-            f"{facts_block}\n\n"
-            f"{hint}"
-            f"Answer the question using the facts above. The key facts have been identified for you, "
-            f"but read ALL facts to verify.\n\n"
-            f"Respond with ONLY this JSON format - NOTHING ELSE:\n"
-            f'{{"reasoning": "Brief chain of thought connecting the facts", '
-            f'"answer": "1-5 word entity or yes/no"}}\n\n'
-            f"RULES:\n"
-            f"- \"reasoning\": briefly explain how the facts connect to your answer.\n"
-            f"- \"answer\": 1-5 words MAX. Extract the specific entity, name, date, or yes/no.\n"
-            f"  BAD: \"The film was directed by Martin Scorsese\" GOOD: \"Martin Scorsese\"\n"
-            f"  BAD: \"Kansas Song (We're From Kansas)\" GOOD: \"Kansas Song\"\n"
-            f"- For yes/no questions, answer \"yes\" or \"no\" (lowercase only).\n"
-            f"- For \"who/which is older/larger/first\" questions, answer with the ENTITY NAME.\n"
-            f"- Give exactly ONE answer. NEVER list multiple answers separated by commas.\n"
-            f"- Do NOT add parenthetical clarifications or alternative names.\n"
-            f"- You MUST provide an answer. NEVER say \"Cannot determine\".\n"
-        )
-
-        # --- Call 2: Answer model generates answer ---
-        if swapped:
-            ans_model_label = self.anthropic_model
-            log.info(f"Specialist (swapped): {ans_model_label} generating answer...")
-            ans_response = self._call_anthropic(answer_prompt, self.anthropic_model, temperature=0.1)
+        if self.prompts and self.prompts.generator_specialist:
+            answer_prompt = self.prompts.generator_specialist.format(question_line=question_line, facts_lines=chr(10).join(facts_lines))
         else:
-            ans_model_label = ollama_model
-            log.info(f"Specialist: {ans_model_label} generating answer...")
-            ans_response = self._call_ollama(answer_prompt, ollama_model, temperature=0.1)
+            answer_prompt = (
+                f"{question_line}\n\n"
+                f"RELEVANT FACTS:\n"
+                f"{chr(10).join(facts_lines)}\n\n"
+                f"EXAMPLES:\n"
+                f"Q: What government position was held by the actress?\n"
+                f"Facts mention: \"served as Ambassador\" and \"held the position of Chief of Protocol\"\n"
+                f'{{\"answer\": \"Chief of Protocol\"}}\n\n'
+                f"Q: How many seats does the venue have?\n"
+                f"Facts mention: \"3,677 seated\"\n"
+                f'{{\"answer\": \"3,677 seated\"}}\n\n'
+                f"Q: Who directed the film?\n"
+                f"Facts mention: \"directed by Eenasul Fateh\"\n"
+                f'{{\"answer\": \"Eenasul Fateh\"}}\n\n'
+                f"RULES:\n"
+                f"- Answer in 1-5 words. Extract the EXACT entity, name, number, or date from the facts.\n"
+                f"- For yes/no questions, answer 'yes' or 'no'.\n"
+                f"- Use the MOST SPECIFIC answer. 'Chief of Protocol' not 'government official'. 'Greenwich Village' not 'New York'.\n"
+                f"- Copy exact numbers from facts. '3,677' not '4,000'. Never round.\n"
+                f"- Answer with a NAME or ENTITY, never a description or sentence.\n"
+                f"  BAD: 'He helped organizations' GOOD: 'Eenasul Fateh'\n"
+                f"  BAD: 'The film was released in 2005' GOOD: '2005'\n\n"
+                f'Respond with ONLY JSON: {{\"answer\": \"your answer\"}}'
+            )
 
-        # Parse answer from response — handle nested JSON bug (Qwen sometimes nests)
+        # --- Call 2: Small model generates answer ---
+        ollama_model = self.model_small
+        log.info(f"Specialist mode: {ollama_model} generating answer...")
+        ans_response = self._call_ollama(answer_prompt, ollama_model, temperature=0.1)
+
+        # Parse answer from response
         answer = ""
         try:
             clean = re.sub(r'```json\s*', '', ans_response)
@@ -272,36 +208,22 @@ class Generator:
             if json_match:
                 parsed = json.loads(json_match.group(0))
                 answer = parsed.get("answer", "").strip()
-                # Fix nested JSON: if answer itself looks like JSON, extract inner answer
-                if answer.startswith('{') and '"answer"' in answer:
-                    try:
-                        inner = json.loads(answer)
-                        answer = str(inner.get("answer", answer)).strip()
-                    except Exception:
-                        pass
         except Exception:
             pass
 
         if not answer:
             answer = self._extract_answer_from_text(ans_response)
 
-        # Fallback: if answer model failed entirely, use SP model's answer
-        if not answer and sp_answer:
-            log.warning(f"{ans_model_label} failed to answer, falling back to SP model's answer")
-            answer = sp_answer
-
         answer = self._normalize_answer(answer)
         generation_time = time.time() - start_time
 
-        model_desc = (f"specialist-swap:{ollama_model}+{self.anthropic_model}"
-                      if swapped else f"specialist:{self.anthropic_model}+{ollama_model}")
         log.info(f"Specialist result: answer='{answer}', {len(supporting_facts)} facts, {generation_time:.1f}s")
 
         return GeneratorOutput(
             answer=answer,
             supporting_facts=supporting_facts,
             full_response=f"[SP: {sp_response}]\n[ANS: {ans_response}]",
-            model_used=model_desc,
+            model_used=f"specialist:{self.model_large}+{ollama_model}",
             generation_time=generation_time,
         )
 
@@ -318,47 +240,9 @@ class Generator:
         return answer, supporting_facts
 
     def _call_llm(self, prompt: str, model: str, temperature: float) -> str:
-        """Dispatch to the appropriate backend."""
-        if self.backend == "anthropic":
-            return self._call_anthropic(prompt, model, temperature)
+        """Call Ollama backend."""
         return self._call_ollama(prompt, model, temperature)
 
-    def _call_anthropic(self, prompt: str, model: str, temperature: float) -> str:
-        """Call Claude API via Anthropic SDK with retry on overload/rate-limit/server errors."""
-        import time as _time
-        max_retries = 4
-        for attempt in range(max_retries):
-            try:
-                log.step(f"Calling Anthropic ({model})...")
-                response = self._anthropic_client.messages.create(
-                    model=model,
-                    max_tokens=512,
-                    temperature=temperature,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                response_text = response.content[0].text
-                log.info(f"Received {len(response_text)} chars from {model}")
-                return response_text
-            except Exception as e:
-                error_str = str(e)
-                retryable = (
-                    "529" in error_str
-                    or "overloaded" in error_str.lower()
-                    or "rate" in error_str.lower()
-                    or "500" in error_str
-                    or "502" in error_str
-                    or "503" in error_str
-                    or "timeout" in error_str.lower()
-                )
-                if retryable and attempt < max_retries - 1:
-                    wait = 5 * (attempt + 1)  # 5s, 10s, 15s, 20s
-                    log.warning(f"Anthropic error (attempt {attempt+1}/{max_retries}): {error_str[:80]}. Retrying in {wait}s...")
-                    _time.sleep(wait)
-                    continue
-                log.error(f"Anthropic API call failed: {e}")
-                raise RuntimeError(f"Anthropic API error: {e}") from e
-
-    # --- Ollama backend (kept for local model testing) ---
     def _call_ollama(self, prompt: str, model: str, temperature: float) -> str:
         url = f"{self.ollama_base_url}/api/generate"
         payload = {
@@ -484,10 +368,8 @@ class Generator:
             log.debug(f"JSON parsing failed: {e}, trying targeted extraction")
 
         # --- Stage 2: Targeted key extraction from broken JSON ---
-        # Handles trailing commas, extra text, single quotes, etc.
         if not answer and fact_mapping:
             try:
-                # Try to extract "answer" value even from malformed JSON
                 answer_match = re.search(
                     r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"', clean_text
                 )
@@ -495,9 +377,8 @@ class Generator:
                     answer = answer_match.group(1).strip()
                     log.info(f"Targeted extraction recovered answer: {answer[:80]}")
 
-                # Try to extract "supporting_fact_numbers" array
                 facts_match = re.search(
-                    r'"supporting_fact_numbers"\s*:\s*\[([^\]]*)\]', clean_text
+                    r'"supporting_fact(?:s|_numbers?)"\s*:\s*\[([^\]]*)\]', clean_text
                 )
                 if facts_match and fact_mapping:
                     nums_str = facts_match.group(1)
@@ -522,7 +403,6 @@ class Generator:
 
         if fact_mapping and not supporting_facts:
             try:
-                # Narrower patterns — only match fact-related references, not arbitrary brackets
                 fact_patterns = [
                     r'\bFact\s+(\d+)',
                     r'\bfact\s+(\d+)',
@@ -587,7 +467,6 @@ class Generator:
 
         # If the LLM echoed back the evidence block, strip it
         if "Evidence:" in text and "QUESTION:" in text:
-            # Take only the part after the last QUESTION or TASK marker
             for marker in ["RESPOND WITH", "TASK:", "RULES:"]:
                 if marker in text:
                     text = text.split(marker)[-1]
@@ -617,7 +496,6 @@ class Generator:
     ) -> tuple:
         """Make a lightweight second LLM call to reformat a failed JSON response."""
         try:
-            # Truncate to avoid context overflow — just need the answer portion
             truncated = raw_response[:500]
             repair_prompt = (
                 f"Extract the answer and supporting fact numbers from this text.\n"
@@ -627,13 +505,8 @@ class Generator:
             )
 
             log.info("JSON repair: making second LLM call to reformat response...")
-            # Route repair call to correct backend based on model name
-            if "claude" in model_name or "haiku" in model_name or "sonnet" in model_name:
-                repair_response = self._call_anthropic(repair_prompt, model_name, temperature=0.0)
-            else:
-                repair_response = self._call_ollama(repair_prompt, model_name, temperature=0.0)
+            repair_response = self._call_ollama(repair_prompt, model_name, temperature=0.0)
 
-            # Parse the repair response (reuse existing logic but without recursive retry)
             answer, supporting_facts = self._parse_output(
                 repair_response, supporting_fact_indices, fact_mapping
             )
@@ -654,7 +527,7 @@ class Generator:
         # Strip whitespace and surrounding quotes
         answer = answer.strip().strip('"').strip("'").strip()
 
-        # Strip parenthetical suffixes: "Kansas Song (We're From Kansas)" → "Kansas Song"
+        # Strip parenthetical suffixes: "Kansas Song (We're From Kansas)" -> "Kansas Song"
         if '(' in answer and answer.endswith(')'):
             stripped = answer[:answer.rfind('(')].strip()
             if stripped:  # Don't strip if nothing left
@@ -712,72 +585,3 @@ class Generator:
             f"small={self.model_small}, large={self.model_large}, "
             f"validate_citations={self.validate_citations})"
         )
-
-if __name__ == "__main__":
-    from pipeline.data_loader import HotpotQALoader
-    from pipeline.indexer import HybridRetriever
-    from pipeline.prompt_builder import PromptBuilder
-    from pipeline.reranker import Reranker
-    from scripts.config import load_config
-
-    cfg = load_config()
-    loader = HotpotQALoader(cfg.data.dev_distractor)
-    examples = loader.load(limit=50)
-
-    seen = set()
-    passages = []
-    for ex in examples:
-        for ctx in ex.contexts:
-            key = (ctx.title, ctx.text)
-            if key not in seen:
-                seen.add(key)
-                passages.append(ctx)
-
-    log.info(f"Building retriever with {len(passages)} passages...")
-    retriever = HybridRetriever.from_config(cfg)
-    retriever.index(passages, show_progress=False)
-
-    log.info("Loading reranker...")
-    reranker = Reranker.from_config(cfg)
-
-    log.info("Initializing prompt builder...")
-    pb = PromptBuilder.from_config(cfg)
-
-    log.info("Initializing generator...")
-    gen = Generator.from_config(cfg)
-
-    for i, ex in enumerate(examples[:3]):
-        log.info(f"\n{'='*80}")
-        log.info(f"Example {i}: {ex.id}")
-        log.info(f"Question: {ex.question}")
-        log.info(f"Gold answer: {ex.answer}")
-
-        retrieved = retriever.retrieve_multihop(
-            ex.question, hops=2, top_k=20, question_type=ex.question_type
-        )
-        log.info(f"Retrieved {len(retrieved)} candidates")
-
-        reranked = reranker.rerank(ex.question, retrieved, top_k=5)
-        log.info(f"Re-ranked to {len(reranked)} passages")
-
-        pb_output = pb.build(ex.question, reranked)
-        log.info(f"Complexity score: {pb_output.complexity_score:.3f}")
-        log.info(f"Target model: {pb_output.target_model}")
-
-        gen_output = gen.generate(
-            prompt=pb_output.prompt,
-            target_model=pb_output.target_model,
-            temperature=(
-                cfg.prompt_builder.temperature_large_model
-                if pb_output.target_model == "complex"
-                else cfg.prompt_builder.temperature_small_model
-            ),
-            supporting_fact_indices=pb_output.supporting_fact_indices,
-        )
-
-        log.info(f"\n{'='*80}")
-        log.info(f"Generated answer: {gen_output.answer}")
-        log.info(f"Supporting facts: {gen_output.supporting_facts}")
-        log.info(f"Model: {gen_output.model_used}")
-        log.info(f"Generation time: {gen_output.generation_time:.2f}s")
-        log.info(f"\n{'='*80}")
