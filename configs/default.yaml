@@ -135,4 +135,5 @@ eval:
   limit: 100
 
   # Output predictions to these files
-  predictions_dir: "results"
+  predictions_dir: "results/predictions"
+  metrics_dir: "results/metrics"

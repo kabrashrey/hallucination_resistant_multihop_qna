@@ -254,7 +254,7 @@ def main():
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("results/predictions.json"),
+        default=Path("results/predictions/predictions.json"),
         help="Output path for predictions",
     )
     parser.add_argument(
@@ -266,7 +266,7 @@ def main():
     parser.add_argument(
         "--metrics",
         type=Path,
-        default=None,
+        default=Path("results/metrics/metrics.json"),
         help="Output path for evaluation metrics",
     )
     args = parser.parse_args()

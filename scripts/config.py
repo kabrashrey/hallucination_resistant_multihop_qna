@@ -100,7 +100,8 @@ class GeneratorConfig:
 @dataclass
 class EvalConfig:
     limit: Optional[int] = 100
-    predictions_dir: str = "results"
+    predictions_dir: str = "results/predictions"
+    metrics_dir: str = "results/metrics"
 
 
 @dataclass
