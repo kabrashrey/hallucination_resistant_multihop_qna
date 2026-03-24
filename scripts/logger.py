@@ -3,8 +3,10 @@ Logger
 """
 
 import sys
+import queue
+import threading
+import atexit
 from typing import Optional
-
 
 # ANSI color codes
 class _Colors:
@@ -17,6 +19,28 @@ class _Colors:
     CYAN = "\033[96m"
     RESET = "\033[0m"
 
+_log_queue = queue.Queue()
+
+def _logger_worker():
+    """Background thread that safely prints to the terminal without blocking."""
+    while True:
+        item = _log_queue.get()
+        if item is None:
+            break
+        msg, file = item
+        print(msg, file=file)
+        _log_queue.task_done()
+
+_worker_thread = threading.Thread(target = _logger_worker, daemon = True)
+_worker_thread.start()
+
+def _cleanup_logger():
+    """Ensure all pending logs are printed before the script exits."""
+    _log_queue.join()
+    _log_queue.put(None)
+    _worker_thread.join()
+
+atexit.register(_cleanup_logger)
 
 class Logger:
     """
@@ -33,7 +57,9 @@ class Logger:
 
     def _log(self, color: str, label: str, msg: str, file=sys.stdout):
         prefix = f"{_Colors.CYAN}{self._prefix}{_Colors.RESET}" if self.name else ""
-        print(f"{prefix}{color}{label}{_Colors.RESET} {msg}", file=file)
+        formatted_msg = f"{prefix}{color}{label}{_Colors.RESET} {msg}"
+        
+        _log_queue.put((formatted_msg, file))
 
     def info(self, msg: str):
         """Green — general progress info"""
@@ -63,7 +89,6 @@ class Logger:
 
 # Global registry so same name returns same logger
 _loggers: dict = {}
-
 
 def get_logger(name: str = "", verbose: bool = False) -> Logger:
     """

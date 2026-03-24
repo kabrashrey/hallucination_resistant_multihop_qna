@@ -335,29 +335,3 @@ def load_hotpotqa_splits(
     return result
 
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        log.error("Usage: python -m pipeline.data_loader <path_to_hotpotqa.json> [limit]")
-        sys.exit(1)
-
-    file_path = sys.argv[1]
-    limit = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-
-    loader = HotpotQALoader(file_path)
-    examples = loader.load(limit=limit)
-
-    log.success(f"Loaded {len(loader)} total examples from {loader.file_path.name}")
-    log.info(f"Showing first {limit}:")
-
-    for ex in examples:
-        log.info(f"  ID:       {ex.id}")
-        log.info(f"  Question: {ex.question}")
-        log.info(f"  Answer:   {ex.answer}")
-        log.info(f"  Type:     {ex.question_type} | Level: {ex.level}")
-        log.info(f"  Contexts: {len(ex.contexts)} passages")
-        log.info(f"  SP Facts: {len(ex.supporting_facts)} facts")
-        log.info(f"  Gold:     {ex.get_gold_sentences()[:2]}...")
-
-    log.info("---Stats---")
-    for k, v in loader.get_stats().items():
-        log.info(f"  {k}: {v}")

@@ -206,6 +206,7 @@ class HybridRetriever:
         self,
         embed_model: str = "nomic-embed-text",
         ollama_base_url: str = "http://localhost:11434",
+        extraction_model: str = "qwen3:8b",
         alpha: float = 0.7,
         alpha_bridge: Optional[float] = None,
         alpha_comparison: Optional[float] = None,
@@ -213,12 +214,22 @@ class HybridRetriever:
         candidate_pool_size: int = 100,
         device: str = "cpu",   # kept for API compat, unused (Ollama handles device)
         batch_size: int = 64,
+        prompts=None,
+        max_bridge_entities: int = 3,
+        extraction_temperature: float = 0.0,
+        extraction_timeout: int = 120,
     ):
+        self.extraction_model = extraction_model
+        self.ollama_base_url = ollama_base_url
         self.alpha = alpha
         self.alpha_bridge = alpha_bridge
         self.alpha_comparison = alpha_comparison
         self.rrf_k = rrf_k
         self.candidate_pool_size = candidate_pool_size
+        self.prompts = prompts
+        self.max_bridge_entities = max_bridge_entities
+        self.extraction_temperature = extraction_temperature
+        self.extraction_timeout = extraction_timeout
 
         self.bm25 = BM25Retriever()
         self.dense = DenseRetriever(
@@ -229,13 +240,6 @@ class HybridRetriever:
         self._passages: List[Passage] = []
         self._texts: List[str] = []
 
-        # Hop-2 strategy config (set by from_config or manually)
-        self._hop2_strategy = "both"
-        self._llm_decompose_threshold = 0.3
-        self._llm_decompose_backend = "anthropic"
-        self._llm_decompose_model = "claude-haiku-4-5-20251001"
-        self._llm_decompose_ollama_model = "qwen2.5:7b"
-
     @classmethod
     def from_config(cls, cfg=None) -> "HybridRetriever":
         """
@@ -245,9 +249,10 @@ class HybridRetriever:
         if cfg is None or isinstance(cfg, (str, Path)):
             cfg = load_config(cfg)
         r = cfg.retriever
-        instance = cls(
+        return cls(
             embed_model=r.embed_model,
             ollama_base_url=r.ollama_base_url,
+            extraction_model=cfg.generator.model_small,
             alpha=r.alpha,
             alpha_bridge=r.alpha_bridge,
             alpha_comparison=r.alpha_comparison,
@@ -255,15 +260,11 @@ class HybridRetriever:
             candidate_pool_size=r.candidate_pool_size,
             device=r.device,
             batch_size=r.batch_size,
+            prompts=getattr(cfg, "prompts", None),
+            max_bridge_entities=r.multihop.max_bridge_entities,
+            extraction_temperature=getattr(r.multihop, "extraction_temperature", 0.0),
+            extraction_timeout=getattr(r.multihop, "extraction_timeout", 120),
         )
-        # Wire hop-2 config (backward compat via getattr)
-        mh = r.multihop
-        instance._hop2_strategy = getattr(mh, 'hop2_strategy', 'both')
-        instance._llm_decompose_threshold = getattr(mh, 'llm_decompose_confidence_threshold', 0.3)
-        instance._llm_decompose_backend = getattr(mh, 'llm_decompose_backend', 'anthropic')
-        instance._llm_decompose_model = getattr(mh, 'llm_decompose_model', 'claude-haiku-4-5-20251001')
-        instance._llm_decompose_ollama_model = getattr(mh, 'llm_decompose_ollama_model', 'qwen2.5:7b')
-        return instance
 
     def _get_alpha(self, question_type: Optional[str] = None) -> float:
         if question_type == "bridge" and self.alpha_bridge is not None:
@@ -290,7 +291,7 @@ class HybridRetriever:
             self._passages = [Passage(title="", sentences=[str(p)]) for p in passages]
             self._texts = [str(p) for p in passages]
 
-        log.info(f"Indexing {len(self._texts)} passages...")
+        log.info(f"\nIndexing {len(self._texts)} passages...")
 
         # Build both indices
         log.step("Building BM25 index...")
@@ -333,6 +334,7 @@ class HybridRetriever:
             "alpha_comparison": self.alpha_comparison,
             "rrf_k": self.rrf_k,
             "num_passages": len(self._passages),
+            "candidate_pool_size": self.candidate_pool_size,
         }
         with open(save_dir / "config.json", "w") as f:
             json.dump(config, f, indent=2)
@@ -504,184 +506,158 @@ class HybridRetriever:
         if passage.title and passage.title.strip() and passage.title not in bridge:
             bridge.insert(0, passage.title)
 
-        return bridge[:7]  # increased limit to 7 entities for better hop 2 coverage
+        return bridge[:self.max_bridge_entities]
 
-    def _retrieve_by_titles(
-        self,
-        titles: List[str],
-        top_k_per_title: int = 3,
-        question_type: Optional[str] = None,
-    ) -> List[RetrievalResult]:
-        """
-        Approach B: retrieve passages using each bridge entity as a standalone query.
-        "Shirley Temple" as a query retrieves better than appending it to the original question.
-        """
-        all_results = []
-        seen = set()
-        for title in titles:
-            title_clean = title.strip()
-            if not title_clean or title_clean in seen:
-                continue
-            seen.add(title_clean)
-            results = self.retrieve(title_clean, top_k=top_k_per_title, question_type=question_type)
-            all_results.extend(results)
-        return all_results
-
-    def _decompose_question_llm(
-        self,
-        question: str,
-        hop1_context: str,
-    ) -> List[str]:
-        """
-        Approach D: Use LLM to decompose a multi-hop question into simpler sub-questions.
-        Returns list of 1-3 sub-questions. Returns [] on any error (graceful fallback).
-        """
-        prompt = (
-            "Decompose this multi-hop question into 2-3 simpler sub-questions "
-            "that would each retrieve a single relevant Wikipedia passage. "
-            "Return ONLY the sub-questions, one per line, no numbering, no explanation.\n\n"
-            f"Question: {question}\n\n"
-            f"Context from initial retrieval:\n{hop1_context}\n\n"
-            "Sub-questions:"
-        )
-
-        try:
-            if self._llm_decompose_backend == "anthropic":
-                import anthropic
-                client = anthropic.Anthropic()
-                response = client.messages.create(
-                    model=self._llm_decompose_model,
-                    max_tokens=200,
-                    temperature=0.0,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                text = response.content[0].text
-            else:
-                import requests
-                resp = requests.post(
-                    f"{self.dense.encoder.base_url}/api/generate",
-                    json={
-                        "model": self._llm_decompose_ollama_model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "temperature": 0.0,
-                    },
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                text = resp.json().get("response", "")
-
-            # Parse: one sub-question per line, strip numbering
-            sub_questions = [
-                line.strip().lstrip("0123456789.-) ")
-                for line in text.strip().split("\n")
-            ]
-            sub_questions = [q for q in sub_questions if q and len(q) > 10]
-            log.info(f"LLM decomposed into {len(sub_questions[:3])} sub-questions")
-            return sub_questions[:3]
-
-        except Exception as e:
-            log.warning(f"LLM question decomposition failed: {e}. Falling back to title-based retrieval.")
+    def _extract_entities_llm(self, passages: List[Passage], question: str) -> List[str]:
+        if not passages:
             return []
+        import requests
+        import json
+        import re
+        
+        system_prompt = self.prompts.indexer_system.strip() if self.prompts and self.prompts.indexer_system else (
+            "You are a precise entity extractor. Respond ONLY with a valid JSON array of strings, with no additional text and no markdown formatting (do not use ```json)."
+        )
+        
+        context = ""
+        for i, p in enumerate(passages):
+            # Truncate text to 800 chars to save prompt context and speed up extraction
+            context += f"Passage {i+1} Title: {p.title}\nPassage {i+1} Text: {p.text[:800]}\n\n"
+            
+        if self.prompts and self.prompts.indexer_user:
+            prompt = self.prompts.indexer_user.format(question=question, context=context)
+        else:
+            prompt = (
+                f"Question: {question}\n\n"
+                f"Context:\n{context}\n"
+                f"Extract the most important named entities (people, places, organizations, specific concepts) from the context that are relevant to finding the final answer to the question. "
+                f"Focus particularly on entities that link different pieces of information together (bridge entities).\n"
+                f"DO NOT include entities that are already explicitly mentioned in the question.\n"
+                f"Output strictly a JSON list of strings, for example: [\"Entity 1\", \"Entity 2\"]. Output nothing else."
+            )
+        
+        try:
+            url = f"{self.ollama_base_url}/api/generate"
+            payload = {
+                "model": self.extraction_model,
+                "prompt": prompt,
+                "system": system_prompt,
+                "stream": False,
+                "temperature": self.extraction_temperature,
+                "options": {"num_ctx": 4096},
+                "keep_alive": -1 # Force Ollama to keep it in VRAM so it's ready for the next question
+            }
+            resp = requests.post(url, json=payload, timeout=self.extraction_timeout)
+            resp.raise_for_status()
+            text = resp.json().get("response", "").strip()
+            
+            entities = []
+            try:
+                # Try parsing the whole text first
+                entities = json.loads(text)
+            except json.JSONDecodeError:
+                match = re.search(r'\[.*?\]', text, re.DOTALL)
+                if match:
+                    try:
+                        entities = json.loads(match.group(0))
+                    except:
+                        pass
+                
+            if isinstance(entities, list):
+                # Also collect passage titles as robust fallbacks
+                titles = [p.title for p in passages if p.title]
+                entities.extend(titles)
+                # Deduplicate and filter out question terms
+                q_lower = question.lower()
+                final_entities = []
+                seen = set()
+                for e in entities:
+                    e_clean = str(e).strip()
+                    if e_clean and e_clean.lower() not in q_lower and e_clean.lower() not in seen:
+                        seen.add(e_clean.lower())
+                        final_entities.append(e_clean)
+                return final_entities
+        except Exception as e:
+            log.warning(f"LLM entity extraction failed: {e}. Falling back to regex.")
+            
+        # Fallback to regex
+        fallback = []
+        for p in passages:
+            fallback.extend(self._extract_bridge_entities(p, question))
+        return list(dict.fromkeys(fallback))
 
     def retrieve_multihop(self, query: str, hops: int = 2, top_k: int = 10,
                           top_k_per_hop: int = 5,
                           question_type: Optional[str] = None) -> List[RetrievalResult]:
         """
-        Multi-hop iterative retrieval for bridge questions.
+        Multi-hop iterative retrieval for bridge questions
 
-        Hop-2 strategies (configured via hop2_strategy):
-          "title" (B): separate retrieval per bridge entity title
-          "concat" (legacy): append entities to original query
-          "both" (B+D): title queries + LLM decomposition when confidence is low
+        How it works:
+          Hop 1: retrieve using the original question
+          Hop 2: extract named entities from hop 1 passages (not just titles!)
+                 reformulate query = question + bridge entities, retrieve again
+          Finally: merge, deduplicate, re-rank results from all hops
 
         query: the original question
-        hops: number of retrieval iterations (default 2)
+        hops: number of retrieval iterations (default 2 for bridge questions)
         top_k: total results to return after merging
-        top_k_per_hop: passages retrieved per hop
+        top_k_per_hop: how many passages to retrieve at each hop
         question_type: "bridge" or "comparison"
 
         Returns: deduplicated, re-ranked RetrievalResult list
+
+        Eg for "What position was held by the woman who portrayed Corliss Archer?":
+          Hop 1 query: "What position was held by the woman who portrayed Corliss Archer?"
+          Hop 1 finds: "Kiss and Tell" passage --> mentions "Shirley Temple"
+          Hop 2 query: "What position was held by the woman who portrayed Corliss Archer? Shirley Temple"
+          Hop 2 finds: "Shirley Temple" passage --> mentions "Chief of Protocol"
         """
         all_results: List[RetrievalResult] = []
         seen_keys: set = set()
+        current_query = query
 
-        # --- HOP 1: unchanged ---
-        hop1_results = self.retrieve(query, top_k=top_k_per_hop, question_type=question_type)
-        hop1_scores = [r.score for r in hop1_results]
-        hop1_confidence = _compute_confidence(hop1_scores)
+        for hop in range(hops):
+            hop_results = self.retrieve(current_query, top_k=top_k_per_hop,
+                                        question_type=question_type)
 
-        bridge_entities = []
-        new_in_hop = 0
-        for r in hop1_results:
-            key = (r.passage.title, r.passage.text)
-            if key not in seen_keys:
-                seen_keys.add(key)
-                r.hop = 0
-                r.confidence = hop1_confidence if new_in_hop == 0 else 0.0
-                new_in_hop += 1
-                all_results.append(r)
-                entities = self._extract_bridge_entities(r.passage, query)
-                bridge_entities.extend(entities)
+            # Compute confidence for this hop (how dominant is the top result?)
+            hop_scores = [r.score for r in hop_results]
+            hop_confidence = _compute_confidence(hop_scores)
 
-        if hops < 2 or not bridge_entities:
-            all_results.sort(key=lambda r: r.score, reverse=True)
-            for i, r in enumerate(all_results):
-                r.rank = i
-            return all_results[:top_k]
+            # Collect new (unseen) passages
+            new_in_hop = 0
+            top_passages_for_extraction = []
+            for r in hop_results[:5]:
+                key = (r.passage.title, r.passage.text)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    r.hop = hop
+                    r.confidence = hop_confidence if new_in_hop == 0 else 0.0  # top result per hop gets confidence
+                    new_in_hop += 1
+                    all_results.append(r)
+                top_passages_for_extraction.append(r.passage)
 
-        # --- HOP 2 ---
-        hop2_candidates = []
-        strategy = self._hop2_strategy
+            # Extract bridge entities using LLM
+            bridge_entities = []
+            if hop < hops - 1 and top_passages_for_extraction:
+                bridge_entities = self._extract_entities_llm(top_passages_for_extraction, query)
+                log.info(f"Hop {hop} extracted entities: {bridge_entities}")
 
-        # Approach B: title-based retrieval (always runs unless strategy=="concat")
-        if strategy in ("title", "both"):
-            # Deduplicate entities while preserving order
-            seen_entity = set()
-            unique_entities = []
-            for e in bridge_entities:
-                if e not in seen_entity:
-                    seen_entity.add(e)
-                    unique_entities.append(e)
+            # Reformulate query for next hop using extracted entities
+            if hop < hops - 1 and bridge_entities:
+                # Prioritize title entities over body entities for hop-2 query
+                hop_passage_titles = {r.passage.title for r in hop_results}
+                body_entities = [e for e in bridge_entities if e not in hop_passage_titles]
+                title_entities = [e for e in bridge_entities if e in hop_passage_titles]
+                unique_entities = list(dict.fromkeys(title_entities + body_entities))[:self.max_bridge_entities]
+                entity_str = " ".join(unique_entities)
+                current_query = f"{query} {entity_str}"
+                log.info(f"Hop {hop+1} formulated query: {current_query}")
 
-            title_results = self._retrieve_by_titles(
-                unique_entities[:7],
-                top_k_per_title=3,
-                question_type=question_type,
-            )
-            hop2_candidates.extend(title_results)
-            log.info(f"Hop-2 title queries: {len(unique_entities[:7])} entities, {len(title_results)} candidates")
-
-        # Approach D: LLM decomposition (fires only when confidence is low)
-        if strategy == "both" and hop1_confidence < self._llm_decompose_threshold:
-            hop1_context = "\n".join(
-                f"- {r.passage.title}: {r.passage.sentences[0] if r.passage.sentences else ''}"
-                for r in hop1_results[:3]
-            )
-            sub_questions = self._decompose_question_llm(query, hop1_context)
-            for sub_q in sub_questions:
-                sub_results = self.retrieve(sub_q, top_k=top_k_per_hop, question_type=question_type)
-                hop2_candidates.extend(sub_results)
-
-        # Legacy: concat strategy
-        if strategy == "concat":
-            unique_entities = list(dict.fromkeys(bridge_entities))[:5]
-            entity_str = " ".join(unique_entities)
-            concat_results = self.retrieve(f"{query} {entity_str}", top_k=top_k_per_hop,
-                                           question_type=question_type)
-            hop2_candidates.extend(concat_results)
-
-        # Merge hop-2 candidates with deduplication
-        for r in hop2_candidates:
-            key = (r.passage.title, r.passage.text)
-            if key not in seen_keys:
-                seen_keys.add(key)
-                r.hop = 1
-                r.confidence = 0.0
-                all_results.append(r)
-
-        # Re-rank and return
+        # Re-rank all collected results by score (descending)
         all_results.sort(key=lambda r: r.score, reverse=True)
+
+        # Re-assign ranks (keep per-hop confidence as-is)
         for i, r in enumerate(all_results):
             r.rank = i
 
@@ -710,52 +686,3 @@ class HybridRetriever:
                 f"passages={len(self._passages)})")
 
 
-if __name__ == "__main__":
-    from pipeline.data_loader import HotpotQALoader
-    cfg = load_config()
-
-    # Load data using config
-    loader = HotpotQALoader(cfg.data.dev_distractor)
-    examples = loader.load(limit=50)
-
-    # Collect unique passages
-    seen = set()
-    passages: List[Passage] = []
-    for ex in examples:
-        for ctx in ex.contexts:
-            key = (ctx.title, ctx.text)
-            if key not in seen:
-                seen.add(key)
-                passages.append(ctx)
-
-    log.info(f"{len(passages)} unique passages from {len(examples)} examples")
-
-    # Build retriever from config
-    retriever = HybridRetriever.from_config(cfg)
-    retriever.index(passages)
-
-    # Save to disk
-    retriever.save(cfg.retriever.index_cache_dir)
-
-    # Load from disk
-    retriever2 = HybridRetriever.from_config(cfg)
-    retriever2.load(cfg.retriever.index_cache_dir)
-
-    # Test single-hop (comparison)
-    q1 = "Were Scott Derrickson and Ed Wood of the same nationality?"
-    log.info(f"Q (comparison): {q1}")
-    results = retriever2.retrieve(q1, top_k=cfg.retriever.top_k, question_type="comparison")
-    for r in results[:3]:
-        conf_str = f" conf={r.confidence:.2f}" if r.confidence > 0 else ""
-        log.info(f"[{r.rank}] score={r.score:.4f}{conf_str} title={r.passage.title}")
-
-    # Test multi-hop (bridge)
-    q2 = "What government position was held by the woman who portrayed Corliss Archer?"
-    log.info(f"Q (bridge, multi-hop): {q2}")
-    mh = cfg.retriever.multihop
-    results = retriever2.retrieve_multihop(q2, hops=mh.hops, top_k=5,
-                                           top_k_per_hop=mh.top_k_per_hop,
-                                           question_type="bridge")
-    for r in results:
-        conf_str = f" conf={r.confidence:.2f}" if r.confidence > 0 else ""
-        log.info(f"[{r.rank}] hop={r.hop} score={r.score:.4f}{conf_str} title={r.passage.title}")

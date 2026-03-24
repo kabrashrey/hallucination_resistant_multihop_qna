@@ -6,12 +6,6 @@ from typing import List, Dict, Optional
 
 import requests
 
-try:
-    import anthropic
-    HAS_ANTHROPIC = True
-except ImportError:
-    HAS_ANTHROPIC = False
-
 from scripts.config import load_config
 from scripts.logger import get_logger
 
@@ -35,9 +29,8 @@ class Generator:
         request_timeout: int = 120,
         validate_citations: bool = True,
         retry_on_parse_failure: bool = True,
-        backend: str = "ollama",
-        anthropic_model: str = "claude-haiku-4-5-20251001",
         specialist_mode: bool = False,
+        prompts=None,
     ):
         self.ollama_base_url = ollama_base_url
         self.model_small = model_small
@@ -45,21 +38,13 @@ class Generator:
         self.request_timeout = request_timeout
         self.validate_citations = validate_citations
         self.retry_on_parse_failure = retry_on_parse_failure
-        self.backend = backend
-        self.anthropic_model = anthropic_model
         self.specialist_mode = specialist_mode
+        self.prompts = prompts
         self.session = requests.Session()  # Connection pooling
 
-        if self.backend == "anthropic" or self.specialist_mode:
-            if not HAS_ANTHROPIC:
-                raise ImportError("anthropic package not installed. Run: pip install anthropic")
-            self._anthropic_client = anthropic.Anthropic()
-            if self.specialist_mode:
-                log.success(f"Generator ready. Specialist mode: Haiku (SP) + Ollama (answer)")
-            else:
-                log.success(f"Generator ready. Backend: Anthropic ({anthropic_model})")
+        if self.specialist_mode:
+            log.success(f"Generator ready. Specialist mode: {self.model_large} (SP) + {self.model_small} (answer)")
         else:
-            self._anthropic_client = None
             log.success(f"Generator ready. Backend: Ollama at {ollama_base_url}")
 
     @classmethod
@@ -74,9 +59,8 @@ class Generator:
             request_timeout=g.request_timeout,
             validate_citations=g.validate_citations,
             retry_on_parse_failure=getattr(g, 'retry_on_parse_failure', True),
-            backend=getattr(g, 'backend', 'ollama'),
-            anthropic_model=getattr(g, 'anthropic_model', 'claude-haiku-4-5-20251001'),
             specialist_mode=getattr(g, 'specialist_mode', False),
+            prompts=getattr(cfg, "prompts", None)
         )
 
     def generate(
@@ -87,16 +71,14 @@ class Generator:
         supporting_fact_indices: Optional[Dict] = None,
         fact_mapping: Optional[Dict] = None,
     ) -> GeneratorOutput:
-        # Specialist mode: Haiku selects facts, Ollama generates answer
+        # Specialist mode: Large Model selects facts, Small Model generates answer
         if self.specialist_mode and fact_mapping:
             return self._generate_specialist(
                 prompt, target_model, temperature,
                 supporting_fact_indices, fact_mapping,
             )
 
-        if self.backend == "anthropic":
-            model_name = self.anthropic_model
-        elif target_model == "complex":
+        if target_model == "complex":
             model_name = self.model_large
         else:
             model_name = self.model_small
@@ -140,15 +122,15 @@ class Generator:
         """
         start_time = time.time()
 
-        # --- Call 1: Haiku selects supporting facts ---
-        log.info("Specialist mode: Haiku selecting facts...")
-        sp_response = self._call_anthropic(prompt, self.anthropic_model, temperature=0.1)
+        # --- Call 1: Large model selects supporting facts ---
+        log.info(f"Specialist mode: {self.model_large} selecting facts...")
+        sp_response = self._call_ollama(prompt, self.model_large, temperature=0.1)
         _, supporting_facts = self._parse_output(sp_response, supporting_fact_indices, fact_mapping)
 
         if not supporting_facts:
             # Retry parse
             repaired_answer, repaired_facts = self._repair_json(
-                sp_response, self.anthropic_model, fact_mapping, supporting_fact_indices
+                sp_response, self.model_large, fact_mapping, supporting_fact_indices
             )
             if repaired_facts:
                 supporting_facts = repaired_facts
@@ -157,7 +139,7 @@ class Generator:
         selected_fact_nums = []
         for sf in supporting_facts:
             for num, (title, idx) in fact_mapping.items():
-                if sf[0] == title and sf[1] == idx:
+                if sf[0] == title and int(sf[1]) == int(idx):
                     selected_fact_nums.append(num)
                     break
 
@@ -184,30 +166,33 @@ class Generator:
                     question_line = f"QUESTION: {line.strip()}"
                     break
 
-        answer_prompt = (
-            f"{question_line}\n\n"
-            f"RELEVANT FACTS:\n"
-            f"{chr(10).join(facts_lines)}\n\n"
-            f"EXAMPLES:\n"
-            f"Q: What government position was held by the actress?\n"
-            f"Facts mention: \"served as Ambassador\" and \"held the position of Chief of Protocol\"\n"
-            f'{{"answer": "Chief of Protocol"}}\n\n'
-            f"Q: How many seats does the venue have?\n"
-            f"Facts mention: \"3,677 seated\"\n"
-            f'{{"answer": "3,677 seated"}}\n\n'
-            f"Q: Who directed the film?\n"
-            f"Facts mention: \"directed by Eenasul Fateh\"\n"
-            f'{{"answer": "Eenasul Fateh"}}\n\n'
-            f"RULES:\n"
-            f"- Answer in 1-5 words. Extract the EXACT entity, name, number, or date from the facts.\n"
-            f"- For yes/no questions, answer 'yes' or 'no'.\n"
-            f"- Use the MOST SPECIFIC answer. 'Chief of Protocol' not 'government official'. 'Greenwich Village' not 'New York'.\n"
-            f"- Copy exact numbers from facts. '3,677' not '4,000'. Never round.\n"
-            f"- Answer with a NAME or ENTITY, never a description or sentence.\n"
-            f"  BAD: 'He helped organizations' GOOD: 'Eenasul Fateh'\n"
-            f"  BAD: 'The film was released in 2005' GOOD: '2005'\n\n"
-            f'Respond with ONLY JSON: {{"answer": "your answer"}}'
-        )
+        if self.prompts and self.prompts.generator_specialist:
+            answer_prompt = self.prompts.generator_specialist.format(question_line=question_line, facts_lines=chr(10).join(facts_lines))
+        else:
+            answer_prompt = (
+                f"{question_line}\n\n"
+                f"RELEVANT FACTS:\n"
+                f"{chr(10).join(facts_lines)}\n\n"
+                f"EXAMPLES:\n"
+                f"Q: What government position was held by the actress?\n"
+                f"Facts mention: \"served as Ambassador\" and \"held the position of Chief of Protocol\"\n"
+                f'{{"answer": "Chief of Protocol"}}\n\n'
+                f"Q: How many seats does the venue have?\n"
+                f"Facts mention: \"3,677 seated\"\n"
+                f'{{"answer": "3,677 seated"}}\n\n'
+                f"Q: Who directed the film?\n"
+                f"Facts mention: \"directed by Eenasul Fateh\"\n"
+                f'{{"answer": "Eenasul Fateh"}}\n\n'
+                f"RULES:\n"
+                f"- Answer in 1-5 words. Extract the EXACT entity, name, number, or date from the facts.\n"
+                f"- For yes/no questions, answer 'yes' or 'no'.\n"
+                f"- Use the MOST SPECIFIC answer. 'Chief of Protocol' not 'government official'. 'Greenwich Village' not 'New York'.\n"
+                f"- Copy exact numbers from facts. '3,677' not '4,000'. Never round.\n"
+                f"- Answer with a NAME or ENTITY, never a description or sentence.\n"
+                f"  BAD: 'He helped organizations' GOOD: 'Eenasul Fateh'\n"
+                f"  BAD: 'The film was released in 2005' GOOD: '2005'\n\n"
+                f'Respond with ONLY JSON: {{"answer": "your answer"}}'
+            )
 
         # --- Call 2: Ollama generates answer ---
         ollama_model = self.model_small
@@ -238,7 +223,7 @@ class Generator:
             answer=answer,
             supporting_facts=supporting_facts,
             full_response=f"[SP: {sp_response}]\n[ANS: {ans_response}]",
-            model_used=f"specialist:{self.anthropic_model}+{ollama_model}",
+            model_used=f"specialist:{self.model_large}+{ollama_model}",
             generation_time=generation_time,
         )
 
@@ -255,28 +240,8 @@ class Generator:
         return answer, supporting_facts
 
     def _call_llm(self, prompt: str, model: str, temperature: float) -> str:
-        """Dispatch to the appropriate backend."""
-        if self.backend == "anthropic":
-            return self._call_anthropic(prompt, model, temperature)
+        """Call Ollama backend."""
         return self._call_ollama(prompt, model, temperature)
-
-    def _call_anthropic(self, prompt: str, model: str, temperature: float) -> str:
-        """Call Claude API via Anthropic SDK."""
-        try:
-            log.step(f"Calling Anthropic ({model})...")
-            response = self._anthropic_client.messages.create(
-                model=model,
-                max_tokens=512,
-                temperature=temperature,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            response_text = response.content[0].text
-        except Exception as e:
-            log.error(f"Anthropic API call failed: {e}")
-            raise RuntimeError(f"Anthropic API error: {e}") from e
-
-        log.info(f"Received {len(response_text)} chars from {model}")
-        return response_text
 
     # --- Ollama backend (kept for local model testing) ---
     def _call_ollama(self, prompt: str, model: str, temperature: float) -> str:
@@ -286,7 +251,8 @@ class Generator:
             "prompt": prompt,
             "stream": False,
             "temperature": temperature,
-            "options": {"num_ctx": 8192},
+            "options": {"num_ctx": 4096},
+            "keep_alive": -1
         }
 
         try:
@@ -416,7 +382,7 @@ class Generator:
 
                 # Try to extract "supporting_fact_numbers" array
                 facts_match = re.search(
-                    r'"supporting_fact_numbers"\s*:\s*\[([^\]]*)\]', clean_text
+                    r'"supporting_fact(?:s|_numbers?)"\s*:\s*\[([^\]]*)\]', clean_text
                 )
                 if facts_match and fact_mapping:
                     nums_str = facts_match.group(1)
@@ -546,11 +512,7 @@ class Generator:
             )
 
             log.info("JSON repair: making second LLM call to reformat response...")
-            # Route repair call to correct backend based on model name
-            if "claude" in model_name or "haiku" in model_name or "sonnet" in model_name:
-                repair_response = self._call_anthropic(repair_prompt, model_name, temperature=0.0)
-            else:
-                repair_response = self._call_ollama(repair_prompt, model_name, temperature=0.0)
+            repair_response = self._call_ollama(repair_prompt, model_name, temperature=0.0)
 
             # Parse the repair response (reuse existing logic but without recursive retry)
             answer, supporting_facts = self._parse_output(
@@ -626,71 +588,3 @@ class Generator:
             f"validate_citations={self.validate_citations})"
         )
 
-if __name__ == "__main__":
-    from pipeline.data_loader import HotpotQALoader
-    from pipeline.indexer import HybridRetriever
-    from pipeline.prompt_builder import PromptBuilder
-    from pipeline.reranker import Reranker
-    from scripts.config import load_config
-
-    cfg = load_config()
-    loader = HotpotQALoader(cfg.data.dev_distractor)
-    examples = loader.load(limit=50)
-
-    seen = set()
-    passages = []
-    for ex in examples:
-        for ctx in ex.contexts:
-            key = (ctx.title, ctx.text)
-            if key not in seen:
-                seen.add(key)
-                passages.append(ctx)
-
-    log.info(f"Building retriever with {len(passages)} passages...")
-    retriever = HybridRetriever.from_config(cfg)
-    retriever.index(passages, show_progress=False)
-
-    log.info("Loading reranker...")
-    reranker = Reranker.from_config(cfg)
-
-    log.info("Initializing prompt builder...")
-    pb = PromptBuilder.from_config(cfg)
-
-    log.info("Initializing generator...")
-    gen = Generator.from_config(cfg)
-
-    for i, ex in enumerate(examples[:3]):
-        log.info(f"\n{'='*80}")
-        log.info(f"Example {i}: {ex.id}")
-        log.info(f"Question: {ex.question}")
-        log.info(f"Gold answer: {ex.answer}")
-
-        retrieved = retriever.retrieve_multihop(
-            ex.question, hops=2, top_k=20, question_type=ex.question_type
-        )
-        log.info(f"Retrieved {len(retrieved)} candidates")
-
-        reranked = reranker.rerank(ex.question, retrieved, top_k=5)
-        log.info(f"Re-ranked to {len(reranked)} passages")
-
-        pb_output = pb.build(ex.question, reranked)
-        log.info(f"Complexity score: {pb_output.complexity_score:.3f}")
-        log.info(f"Target model: {pb_output.target_model}")
-
-        gen_output = gen.generate(
-            prompt=pb_output.prompt,
-            target_model=pb_output.target_model,
-            temperature=(
-                cfg.prompt_builder.temperature_large_model
-                if pb_output.target_model == "complex"
-                else cfg.prompt_builder.temperature_small_model
-            ),
-            supporting_fact_indices=pb_output.supporting_fact_indices,
-        )
-
-        log.info(f"\n{'='*80}")
-        log.info(f"Generated answer: {gen_output.answer}")
-        log.info(f"Supporting facts: {gen_output.supporting_facts}")
-        log.info(f"Model: {gen_output.model_used}")
-        log.info(f"Generation time: {gen_output.generation_time:.2f}s")
-        log.info(f"\n{'='*80}")
