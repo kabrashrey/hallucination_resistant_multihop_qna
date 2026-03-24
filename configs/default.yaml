@@ -51,13 +51,13 @@ retriever:
   # --- Multi-hop ---
   multihop:
     hops: 2 # number of retrieval iterations
-    top_k_per_hop: 15 # passages retrieved per hop (widened from 10 for better recall)
-    max_bridge_entities: 5 # max entities extracted per hop for query reformulation (raised from 3)
+    top_k_per_hop: 10 # passages retrieved per hop (doubled from 5 for better recall)
+    max_bridge_entities: 3 # max entities extracted per hop for query reformulation (raised from 3)
     hop2_strategy: "both" # "title" (B), "concat" (legacy), "both" (B+D)
     llm_decompose_confidence_threshold: 0.3 # trigger LLM decomposition below this hop-1 confidence
-    llm_decompose_backend: "ollama" # "anthropic" or "ollama"
-    llm_decompose_model: "claude-haiku-4-5-20251001"
     llm_decompose_ollama_model: "qwen2.5:7b"
+    extraction_temperature: 0.0 # LLM temperature for bridge entity extraction
+    extraction_timeout: 120 # Web request timeout for local LLM / Anthropic during entity extraction
 
   # --- Persistence ---
   index_cache_dir: "index_cache"
@@ -77,11 +77,9 @@ reranker:
   # Reverted from 7→5: wider retrieval (top_k_per_hop=10) feeds enough candidates, but 7 passages overwhelms the LLM (EM dropped 32%). Keep presentation narrow.
   top_k: 5
 
-  # Min cosine similarity for a sentence to be selected as a supporting fact.
-  # Lowered from 0.4 to improve SP recall (was 30%, targeting >40%)
-  sentence_score_threshold: 0.25
-  max_sentences_per_passage: 5 # Max supporting sentences to keep per passage (to limit SP prediction)
-  sentence_passage_limit: 5 # Only select sentences from top N reranked passages
+  sentence_score_threshold: 0.4 # Minimum cosine sim to select a sentence as evidence
+  max_sentences_per_passage: 5 # Max sentences to extract from any single passage
+  sentence_passage_limit: 3 # Only select sentences from top N reranked passages
   title_overlap_boost: 0.05 # Additive boost to cosine sim if passage title shares words with query
 
   # Batch size for cross-encoder inference
@@ -109,13 +107,13 @@ prompt_builder:
     ]
 
   # Complexity scoring weights (sum to 1.0 for normalized score)
-  complexity_length_weight: 0.25
+  complexity_length_weight: 0.10
   complexity_length_threshold: 50
-  complexity_keywords_weight: 0.25
-  complexity_confidence_weight: 0.25
-  complexity_sentences_weight: 0.25
+  complexity_keywords_weight: 0.35
+  complexity_confidence_weight: 0.20
+  complexity_sentences_weight: 0.35
   complexity_sentence_threshold: 5
-  complexity_routing_threshold: 0.6
+  complexity_routing_threshold: 0.50
 
   # LLM temperatures
   temperature_small_model: 0.1 # for simple queries
@@ -124,15 +122,12 @@ prompt_builder:
 # --- Generator ---
 generator:
   ollama_base_url: "http://localhost:11434"
-  model_small: "qwen2.5:7b"
-  model_large: "qwen2.5:7b"
-  request_timeout: 600
+  model_small: "llama3.2:latest"
+  model_large: "qwen3:8b"
+  request_timeout: 300
   validate_citations: true
   retry_on_parse_failure: true
-  backend: "ollama" # "ollama" or "anthropic"
-  anthropic_model: "claude-sonnet-4-6" # Claude model (used when backend=anthropic)
-  specialist_mode: true # true: Sonnet selects facts, Ollama answers
-  specialist_swap: true # true: SWAP roles — Ollama selects facts, Sonnet answers
+  specialist_mode: false # true: model_large selects facts, model_small answers
 
 # --- Evaluation ---
 eval:
