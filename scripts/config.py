@@ -102,6 +102,7 @@ class EvalConfig:
     limit: Optional[int] = 100
     predictions_dir: str = "results/predictions"
     metrics_dir: str = "results/metrics"
+    parallel_workers: int = 3  # ThreadPoolExecutor workers for pipeline parallelism
 
 
 @dataclass
@@ -113,6 +114,34 @@ class Config:
     generator: GeneratorConfig = field(default_factory=GeneratorConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     prompts: PromptsConfig = field(default_factory=PromptsConfig)
+
+    def validate(self) -> None:
+        """Raise ValueError early if config values are out of sensible range."""
+        r = self.retriever
+        if not (0.0 <= r.alpha <= 1.0):
+            raise ValueError(f"retriever.alpha must be in [0, 1], got {r.alpha}")
+        if r.alpha_bridge is not None and not (0.0 <= r.alpha_bridge <= 1.0):
+            raise ValueError(f"retriever.alpha_bridge must be in [0, 1], got {r.alpha_bridge}")
+        if r.alpha_comparison is not None and not (0.0 <= r.alpha_comparison <= 1.0):
+            raise ValueError(f"retriever.alpha_comparison must be in [0, 1], got {r.alpha_comparison}")
+        if r.candidate_pool_size <= 0:
+            raise ValueError(f"retriever.candidate_pool_size must be > 0, got {r.candidate_pool_size}")
+
+        rr = self.reranker
+        if rr.top_k <= 0:
+            raise ValueError(f"reranker.top_k must be > 0, got {rr.top_k}")
+        if not (0.0 <= rr.sentence_score_threshold <= 1.0):
+            raise ValueError(f"reranker.sentence_score_threshold must be in [0, 1], got {rr.sentence_score_threshold}")
+
+        pb = self.prompt_builder
+        if not (0.0 <= pb.complexity_routing_threshold <= 1.0):
+            raise ValueError(f"prompt_builder.complexity_routing_threshold must be in [0, 1], got {pb.complexity_routing_threshold}")
+        if pb.max_evidence_chars <= 0:
+            raise ValueError(f"prompt_builder.max_evidence_chars must be > 0, got {pb.max_evidence_chars}")
+
+        ev = self.eval
+        if ev.parallel_workers <= 0:
+            raise ValueError(f"eval.parallel_workers must be > 0, got {ev.parallel_workers}")
 
 
 def _dict_to_dataclass(cls, d: dict):
@@ -181,4 +210,5 @@ def load_config(path: Union[str, Path, None] = None) -> Config:
             raw_prompts = yaml.safe_load(f) or {}
         cfg.prompts = _dict_to_dataclass(PromptsConfig, raw_prompts)
 
+    cfg.validate()
     return cfg
