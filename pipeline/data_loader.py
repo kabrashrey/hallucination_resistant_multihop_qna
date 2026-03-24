@@ -26,7 +26,7 @@ class Passage:
 import json
 import sys
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 from typing import List, Dict, Optional, Union
 from scripts.logger import get_logger
 log = get_logger("data_loader")
@@ -256,8 +256,9 @@ class HotpotQALoader:
                 if key not in seen:
                     seen.add(key)
                     pid = f"{ctx.title}::{idx}"
-                    ctx.passage_id = pid
-                    self._passage_index[pid] = ctx
+                    # Use replace() so we don't mutate the shared Passage in _examples
+                    indexed_ctx = dc_replace(ctx, passage_id=pid)
+                    self._passage_index[pid] = indexed_ctx
                     idx += 1
         return self._passage_index
 

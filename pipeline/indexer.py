@@ -11,6 +11,8 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import json
 import pickle
+import re
+import requests
 import numpy as np
 from pathlib import Path
 import faiss
@@ -239,6 +241,7 @@ class HybridRetriever:
         )
         self._passages: List[Passage] = []
         self._texts: List[str] = []
+        self._session = requests.Session()  # Connection pooling for LLM calls
 
     @classmethod
     def from_config(cls, cfg=None) -> "HybridRetriever":
@@ -466,7 +469,6 @@ class HybridRetriever:
           - Titles with punctuation: "Dr. Strange", "St. Louis"
           - Parenthetical context: "(1928-1992)", "(actress)"
         """
-        import re
         question_lower = question.lower()
         text = passage.text
 
@@ -511,9 +513,6 @@ class HybridRetriever:
     def _extract_entities_llm(self, passages: List[Passage], question: str) -> List[str]:
         if not passages:
             return []
-        import requests
-        import json
-        import re
         
         system_prompt = self.prompts.indexer_system.strip() if self.prompts and self.prompts.indexer_system else (
             "You are a precise entity extractor. Respond ONLY with a valid JSON array of strings, with no additional text and no markdown formatting (do not use ```json)."
@@ -547,7 +546,7 @@ class HybridRetriever:
                 "options": {"num_ctx": 4096},
                 "keep_alive": -1 # Force Ollama to keep it in VRAM so it's ready for the next question
             }
-            resp = requests.post(url, json=payload, timeout=self.extraction_timeout)
+            resp = self._session.post(url, json=payload, timeout=self.extraction_timeout)
             resp.raise_for_status()
             text = resp.json().get("response", "").strip()
             

@@ -67,15 +67,9 @@ class PromptBuilder:
             instructions = self._build_instructions(query)
 
         if self.cfg.evidence_first:
-            if use_citation_selection:
-                prompt = f"{evidence_block}\n\n{instructions}"
-            else:
-                prompt = f"{evidence_block}\n\n{instructions}"
+            prompt = f"{evidence_block}\n\n{instructions}"
         else:
-            if use_citation_selection:
-                prompt = f"{instructions}\n\n{evidence_block}"
-            else:
-                prompt = f"{instructions}\n\n{evidence_block}"
+            prompt = f"{instructions}\n\n{evidence_block}"
 
         if len(prompt) > self.cfg.max_evidence_chars:
             log.warning(f"Prompt too long ({len(prompt)} chars), truncating to {self.cfg.max_evidence_chars}")
@@ -154,11 +148,10 @@ class PromptBuilder:
 
         for passage_idx, result in enumerate(results):
             passage = result.passage
-            facts = []
-
-            for sent_str, sent_idx in zip(result.supporting_sentences, result.supporting_sentence_indices):
-                facts.append((passage.title, sent_idx))
-
+            facts = [
+                (passage.title, sent_idx)
+                for sent_idx in result.supporting_sentence_indices
+            ]
             fact_indices[passage_idx] = facts
 
         return fact_indices

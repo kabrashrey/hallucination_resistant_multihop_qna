@@ -84,7 +84,7 @@ class Generator:
             model_name = self.model_small
 
         start_time = time.time()
-        response_text = self._call_llm(prompt, model_name, temperature)
+        response_text = self._call_ollama(prompt, model_name, temperature)
         generation_time = time.time() - start_time
 
         answer, supporting_facts = self._parse_output(response_text, supporting_fact_indices, fact_mapping)
@@ -235,15 +235,11 @@ class Generator:
         supporting_fact_indices: Optional[Dict] = None,
         fact_mapping: Optional[Dict] = None,
     ) -> tuple:
-        response_text = self._call_llm(prompt, model_name, temperature)
+        response_text = self._call_ollama(prompt, model_name, temperature)
         answer, supporting_facts = self._parse_output(response_text, supporting_fact_indices, fact_mapping)
         return answer, supporting_facts
 
-    def _call_llm(self, prompt: str, model: str, temperature: float) -> str:
-        """Call Ollama backend."""
-        return self._call_ollama(prompt, model, temperature)
-
-    # --- Ollama backend (kept for local model testing) ---
+    # --- Ollama backend ---
     def _call_ollama(self, prompt: str, model: str, temperature: float) -> str:
         url = f"{self.ollama_base_url}/api/generate"
         payload = {
@@ -293,7 +289,8 @@ class Generator:
 
     def _parse_output(
         self, response_text: str, supporting_fact_indices: Optional[Dict] = None,
-        fact_mapping: Optional[Dict] = None
+        fact_mapping: Optional[Dict] = None,
+        _allow_repair: bool = True,
     ) -> tuple:
         supporting_facts = []
         answer = ""
@@ -514,9 +511,9 @@ class Generator:
             log.info("JSON repair: making second LLM call to reformat response...")
             repair_response = self._call_ollama(repair_prompt, model_name, temperature=0.0)
 
-            # Parse the repair response (reuse existing logic but without recursive retry)
+            # Pass _allow_repair=False to prevent infinite recursion
             answer, supporting_facts = self._parse_output(
-                repair_response, supporting_fact_indices, fact_mapping
+                repair_response, supporting_fact_indices, fact_mapping, _allow_repair=False
             )
 
             if supporting_facts:

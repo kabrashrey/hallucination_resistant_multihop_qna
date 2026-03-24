@@ -67,7 +67,9 @@ class Reranker:
         if cfg is None or isinstance(cfg, (str,)):
             cfg = load_config(cfg)
         r = cfg.reranker
-        ollama_url = cfg.generator.ollama_base_url  
+        # Use retriever's Ollama URL — the reranker uses it for sentence embedding,
+        # which is a retrieval-side concern, not a generator-side concern.
+        ollama_url = cfg.retriever.ollama_base_url
         return cls(
             model_name=r.model_name,
             sentence_model_name=r.sentence_model_name,
@@ -187,11 +189,11 @@ class Reranker:
 
             # Rank-aware guaranteed minimum: top passages get more sentences
             if r.rank == 0:
-                min_guarantee = 2  # Top 2 passages: guarantee 4 sentences
+                min_guarantee = 2  # Rank 0 (best passage): guarantee at least 2 sentences
             elif r.rank == 1:
-                min_guarantee = 3  # Middle passages: guarantee 3
+                min_guarantee = 2  # Rank 1: guarantee at least 2 sentences
             else:
-                min_guarantee = 1  # Lower passages: guarantee 2
+                min_guarantee = 1  # Lower passages: guarantee 1
 
             for i, (score, sent, orig_idx) in enumerate(paired):
                 if i < min_guarantee:

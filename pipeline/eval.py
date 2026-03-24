@@ -162,8 +162,8 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
                 "sp": [],
             }, {"retrieval": 0.0, "rerank": 0.0, "sentence": 0.0, "prediction": 0.0}
 
-    max_workers = 3
-    log.info(f"Running pipeline with exactly {max_workers} parallel workers to respect OLLAMA_NUM_PARALLEL constraints...")
+    max_workers = cfg.eval.parallel_workers
+    log.info(f"Running pipeline with {max_workers} parallel workers (cfg.eval.parallel_workers)...")
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks

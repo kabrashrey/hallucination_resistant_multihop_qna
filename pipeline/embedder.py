@@ -20,9 +20,18 @@ class OllamaEmbedder:
 
         log.info(f"Connecting to Ollama embedder ({model}) at {base_url}...")
         try:
-            dim = self._embed_batch(["ping"])[0].shape[0]
+            # Lightweight health check — avoids an unnecessary embed round-trip on every init
+            resp = requests.get(f"{self.base_url}/api/tags", timeout=10)
+            resp.raise_for_status()
+            # Determine embedding dimension with a single real call
+            dim = self._embed_batch(["dim_probe"])[0].shape[0]
             self._dim = dim
             log.success(f"OllamaEmbedder ready — model={model}, dim={dim}")
+        except requests.ConnectionError as e:
+            raise RuntimeError(
+                f"Cannot connect to Ollama at {base_url}. "
+                f"Is 'ollama serve' running and '{model}' pulled? Error: {e}"
+            ) from e
         except Exception as e:
             raise RuntimeError(
                 f"Cannot connect to Ollama at {base_url}. "
