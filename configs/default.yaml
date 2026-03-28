@@ -21,8 +21,8 @@ retriever:
   # Ollama server URL
   ollama_base_url: "http://localhost:11434"
 
-  # Device kept for API compatibility (not used anymore, Ollama handles device internally)
-  device: "cpu"
+  # Device mapping (auto will pick CUDA > MPS > CPU)
+  device: "auto"
 
   # Batch size for embedding passages — reduced from 64 for larger model
   batch_size: 32
@@ -71,7 +71,7 @@ reranker:
   # Ollama embedding model for sentence selection (must match retriever embed_model).
   sentence_model_name: "qwen3-embedding:8b"
 
-  # device: "cpu"
+  device: "auto"
 
   # No. of passages kept after re-ranking (fed to prompt builder)
   # Reverted from 7→5: wider retrieval (top_k_per_hop=10) feeds enough candidates, but 7 passages overwhelms the LLM (EM dropped 32%). Keep presentation narrow.

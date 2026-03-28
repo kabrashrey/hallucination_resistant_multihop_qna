@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from rank_bm25 import BM25Okapi
 from pipeline.embedder import OllamaEmbedder
 from pipeline.data_loader import Passage
-from scripts.config import load_config
+from scripts.config import load_config, get_best_device
 from scripts.logger import get_logger
 log = get_logger("indexer")
 
@@ -145,8 +145,11 @@ class DenseRetriever:
         ollama_base_url: str = "http://localhost:11434",
         batch_size: int = 64,
         # legacy param kept so from_config() call sites don't break
-        device: str = "cpu",
+        device: str = "auto",
     ):
+        if device == "auto":
+            device = get_best_device()
+        self.device = device
         self.model_name = model_name
         self.batch_size = batch_size
         self.encoder = OllamaEmbedder(
@@ -214,7 +217,7 @@ class HybridRetriever:
         alpha_comparison: Optional[float] = None,
         rrf_k: int = 20,
         candidate_pool_size: int = 100,
-        device: str = "cpu",   # kept for API compat, unused (Ollama handles device)
+        device: str = "auto",   # kept for API compat, unused (Ollama handles device)
         batch_size: int = 64,
         prompts=None,
         max_bridge_entities: int = 3,

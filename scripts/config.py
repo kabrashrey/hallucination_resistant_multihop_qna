@@ -7,6 +7,17 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
+def get_best_device() -> str:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
+
 
 @dataclass
 class DataConfig:
@@ -40,7 +51,7 @@ class MultihopConfig:
 class RetrieverConfig:
     embed_model: str = "nomic-embed-text"
     ollama_base_url: str = "http://localhost:11434"
-    device: str = "cpu"
+    device: str = field(default_factory=get_best_device)
     batch_size: int = 64
     alpha: float = 0.7
     alpha_bridge: Optional[float] = 0.5
@@ -56,7 +67,7 @@ class RetrieverConfig:
 class RerankerConfig:
     model_name: str = "BAAI/bge-reranker-v2-m3"
     sentence_model_name: str = "nomic-embed-text"
-    device: str = "cpu"
+    device: str = field(default_factory=get_best_device)
     top_k: int = 5                        
     sentence_score_threshold: float = 0.4 
     max_sentences_per_passage: int = 5    
@@ -186,13 +197,18 @@ def load_config(path: Union[str, Path, None] = None) -> Config:
 
     if "retriever" in raw:
         ret = raw["retriever"]
+        if ret.get("device") in ("auto", "cpu"):
+            ret["device"] = get_best_device()
         multihop_raw = ret.pop("multihop", None)
         cfg.retriever = _dict_to_dataclass(RetrieverConfig, ret)
         if multihop_raw:
             cfg.retriever.multihop = _dict_to_dataclass(MultihopConfig, multihop_raw)
 
     if "reranker" in raw:
-        cfg.reranker = _dict_to_dataclass(RerankerConfig, raw["reranker"])
+        rr = raw["reranker"]
+        if rr.get("device") in ("auto", "cpu"):
+            rr["device"] = get_best_device()
+        cfg.reranker = _dict_to_dataclass(RerankerConfig, rr)
 
     if "prompt_builder" in raw:
         cfg.prompt_builder = _dict_to_dataclass(PromptBuilderConfig, raw["prompt_builder"])
