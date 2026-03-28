@@ -11,6 +11,7 @@ from sentence_transformers import CrossEncoder
 from pipeline.data_loader import Passage
 from pipeline.embedder import OllamaEmbedder
 from pipeline.indexer import RetrievalResult
+from scripts.config import get_best_device
 from scripts.logger import get_logger
 
 log = get_logger("reranker")
@@ -34,13 +35,15 @@ class Reranker:
         model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         sentence_model_name: str = "nomic-embed-text",
         ollama_base_url: str = "http://localhost:11434",
-        device: str = "cpu",
+        device: str = "auto",
         sentence_score_threshold: float = 0.4,
         max_sentences_per_passage: int = 5,
         batch_size: int = 32,
         sentence_passage_limit: int = 3,
         title_overlap_boost: float = 0.05,
     ):
+        if device == "auto":
+            device = get_best_device()
         self.model_name = model_name
         self.device = device
         self.sentence_score_threshold = sentence_score_threshold
