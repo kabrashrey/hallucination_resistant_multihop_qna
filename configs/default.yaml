@@ -132,7 +132,7 @@ generator:
 # --- Evaluation ---
 eval:
   # How many examples to evaluate on (null = all)
-  limit: 100
+  limit: null
 
   # Output predictions to these files
   predictions_dir: "results/predictions"

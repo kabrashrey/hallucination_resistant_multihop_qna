@@ -110,7 +110,7 @@ class GeneratorConfig:
 
 @dataclass
 class EvalConfig:
-    limit: Optional[int] = 100
+    limit: Optional[int] = None
     predictions_dir: str = "results/predictions"
     metrics_dir: str = "results/metrics"
     parallel_workers: int = 3  # ThreadPoolExecutor workers for pipeline parallelism

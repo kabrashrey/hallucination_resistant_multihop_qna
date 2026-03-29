@@ -249,7 +249,7 @@ def main():
         "--limit",
         type=int,
         default=None,
-        help="Limit number of examples (for quick testing)",
+        help="Limit number of examples (0 or omit for full dataset)",
     )
     parser.add_argument(
         "--output",
@@ -278,19 +278,21 @@ def main():
     elif args.split == "test_fullwiki":
         cfg.data.dev_distractor = cfg.data.test_fullwiki
 
-    if args.limit:
-        cfg.eval.limit = args.limit
+    if args.limit is not None:
+        cfg.eval.limit = args.limit if args.limit > 0 else None
 
     log.info(f"{'='*80}")
     log.info(f"Evaluating on: {args.split}")
-    if args.limit:
-        log.info(f"Limit: {args.limit} examples")
+    if cfg.eval.limit:
+        log.info(f"Limit: {cfg.eval.limit} examples")
+    else:
+        log.info("Limit: None (Full Dataset)")
     log.info(f"Output: {args.output}")
     log.info(f"{'='*80}")
 
     examples, retriever, reranker, pb, gen, cfg = build_pipeline(cfg)
 
-    predictions = run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit=args.limit)
+    predictions = run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit=cfg.eval.limit)
 
     save_predictions(predictions, args.output)
 
