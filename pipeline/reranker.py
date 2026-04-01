@@ -192,11 +192,11 @@ class Reranker:
 
             # Rank-aware guaranteed minimum: top passages get more sentences
             if r.rank == 0:
-                min_guarantee = 2  # Rank 0 (best passage): guarantee at least 2 sentences
+                min_guarantee = 2 
             elif r.rank == 1:
-                min_guarantee = 2  # Rank 1: guarantee at least 2 sentences
+                min_guarantee = 2
             else:
-                min_guarantee = 1  # Lower passages: guarantee 1
+                min_guarantee = 1
 
             for i, (score, sent, orig_idx) in enumerate(paired):
                 if i < min_guarantee:
@@ -209,6 +209,14 @@ class Reranker:
                     selected_indices.append(orig_idx)
                 else:
                     break  # Sorted descending — all remaining are below threshold
+            
+            if r.rank <= 1 and 0 not in selected_indices and orig_indices and 0 in orig_indices:
+                pos_in_orig = orig_indices.index(0)
+                sent_0_text = sents[pos_in_orig]
+                sent_0_score = scores[pos_in_orig]
+                selected_sents.append(sent_0_text)
+                selected_scores.append(round(float(sent_0_score), 4))
+                selected_indices.append(0)
 
             # Optionally, sort the selected sentences chronologically (by orig_idx). This makes the prompt read more naturally.
             chronological = sorted(zip(selected_indices, selected_sents, selected_scores))

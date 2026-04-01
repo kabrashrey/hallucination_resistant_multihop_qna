@@ -461,6 +461,14 @@ class Generator:
                 log.debug(f"Free-form generation parsing failed: {e}")
 
         answer = self._normalize_answer(answer)
+        # --- Fallback: if we have an answer but NO supporting facts, return ALL facts from the mapping.
+        if answer and not supporting_facts and fact_mapping:
+            log.info(f"SP fallback: returning all {len(fact_mapping)} facts from mapping")
+            for fact_num in sorted(fact_mapping.keys()):
+                title, sent_idx = fact_mapping[fact_num]
+                supporting_facts.append([title, int(sent_idx)])
+
+        answer = self._normalize_answer(answer)
         return answer, supporting_facts
 
     def _extract_answer_from_text(self, response_text: str) -> str:
@@ -544,21 +552,30 @@ class Generator:
             answer = re.sub(pattern, '', answer, flags=re.IGNORECASE)
 
         # Remove trailing periods from short answers (common LLM habit)
-        if len(answer.split()) <= 5 and answer.endswith('.'):
-            answer = answer[:-1].strip()
+        # if len(answer.split()) <= 5 and answer.endswith('.'):
+        #     answer = answer[:-1].strip()
 
-        # Remove trailing punctuation from short answers
+        # # Remove trailing punctuation from short answers
+        # if len(answer.split()) <= 5:
+        #     answer = answer.rstrip('.,;:!?')
+
+        # # Normalize yes/no/noanswer to lowercase (HotpotQA eval normalizes these)
+        # answer_lower = answer.lower().strip()
+        # if answer_lower in ('yes', 'no', 'noanswer', 'yes.', 'no.'):
+        #     answer = answer_lower.rstrip('.')
+
+        # # Strip leading "the " for short entity answers
+        # if answer.lower().startswith('the ') and len(answer.split()) <= 4:
+        #     answer = answer[4:]
+
+        # Do NOT strip commas or semicolons — they appear in entity names like "Mondelez International, Inc."
         if len(answer.split()) <= 5:
-            answer = answer.rstrip('.,;:!?')
+            answer = answer.rstrip('.!?')
 
         # Normalize yes/no/noanswer to lowercase (HotpotQA eval normalizes these)
         answer_lower = answer.lower().strip()
         if answer_lower in ('yes', 'no', 'noanswer', 'yes.', 'no.'):
             answer = answer_lower.rstrip('.')
-
-        # Strip leading "the " for short entity answers
-        if answer.lower().startswith('the ') and len(answer.split()) <= 4:
-            answer = answer[4:]
 
         return answer.strip()
 

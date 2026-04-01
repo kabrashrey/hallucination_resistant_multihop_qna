@@ -629,7 +629,7 @@ class HybridRetriever:
             # Collect new (unseen) passages
             new_in_hop = 0
             top_passages_for_extraction = []
-            for r in hop_results[:5]:
+            for r in hop_results:
                 key = (r.passage.title, r.passage.text)
                 if key not in seen_keys:
                     seen_keys.add(key)
