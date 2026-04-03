@@ -91,7 +91,7 @@ prompt_builder:
   include_passage_numbers: true
   include_sentence_indices: true
   evidence_first: true # Context before question or Question before Context
-  max_evidence_chars: 8000 # Max characters before trunkating the prompt (for context limits)
+  max_evidence_chars: 6000 # Max characters before trunkating the prompt (for context limits)
   bridge_keywords:
     [
       "who",

@@ -24,8 +24,8 @@ class Generator:
     def __init__(
         self,
         ollama_base_url: str = "http://localhost:11434",
-        model_small: str = "mistral:7b",
-        model_large: str = "mistral:7b",
+        model_small: str = "llama3.2:latest",
+        model_large: str = "qwen3:8b",
         request_timeout: int = 120,
         validate_citations: bool = True,
         retry_on_parse_failure: bool = True,
@@ -552,30 +552,21 @@ class Generator:
             answer = re.sub(pattern, '', answer, flags=re.IGNORECASE)
 
         # Remove trailing periods from short answers (common LLM habit)
-        # if len(answer.split()) <= 5 and answer.endswith('.'):
-        #     answer = answer[:-1].strip()
+        if len(answer.split()) <= 5 and answer.endswith('.'):
+            answer = answer[:-1].strip()
 
-        # # Remove trailing punctuation from short answers
-        # if len(answer.split()) <= 5:
-        #     answer = answer.rstrip('.,;:!?')
-
-        # # Normalize yes/no/noanswer to lowercase (HotpotQA eval normalizes these)
-        # answer_lower = answer.lower().strip()
-        # if answer_lower in ('yes', 'no', 'noanswer', 'yes.', 'no.'):
-        #     answer = answer_lower.rstrip('.')
-
-        # # Strip leading "the " for short entity answers
-        # if answer.lower().startswith('the ') and len(answer.split()) <= 4:
-        #     answer = answer[4:]
-
-        # Do NOT strip commas or semicolons — they appear in entity names like "Mondelez International, Inc."
+        # Remove trailing punctuation from short answers
         if len(answer.split()) <= 5:
-            answer = answer.rstrip('.!?')
+            answer = answer.rstrip('.,;:!?')
 
         # Normalize yes/no/noanswer to lowercase (HotpotQA eval normalizes these)
         answer_lower = answer.lower().strip()
         if answer_lower in ('yes', 'no', 'noanswer', 'yes.', 'no.'):
             answer = answer_lower.rstrip('.')
+
+        # Strip leading "the " for short entity answers
+        if answer.lower().startswith('the ') and len(answer.split()) <= 4:
+            answer = answer[4:]
 
         return answer.strip()
 

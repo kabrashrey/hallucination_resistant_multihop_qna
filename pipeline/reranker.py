@@ -210,14 +210,6 @@ class Reranker:
                 else:
                     break  # Sorted descending — all remaining are below threshold
             
-            if r.rank <= 1 and 0 not in selected_indices and orig_indices and 0 in orig_indices:
-                pos_in_orig = orig_indices.index(0)
-                sent_0_text = sents[pos_in_orig]
-                sent_0_score = scores[pos_in_orig]
-                selected_sents.append(sent_0_text)
-                selected_scores.append(round(float(sent_0_score), 4))
-                selected_indices.append(0)
-
             # Optionally, sort the selected sentences chronologically (by orig_idx). This makes the prompt read more naturally.
             chronological = sorted(zip(selected_indices, selected_sents, selected_scores))
              

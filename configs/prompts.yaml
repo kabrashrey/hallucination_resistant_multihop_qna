@@ -19,13 +19,14 @@ builder_citation: |
 
   RESPOND WITH THIS JSON FORMAT - NOTHING ELSE:
   {{
+    "reasoning": "Brief chain of thought connecting the facts to the answer",
     "supporting_fact_numbers": [0, 1, 3],
     "answer": "Short answer here"
   }}
 
   RULES:
   - Output ONLY raw valid JSON. Do NOT wrap it in markdown backticks (```json).
-  - "reasoning": briefly explain how the facts connect to your answer. SELECT AT LEAST 2 facts, typically 2-4. For multi-hop questions, include facts from DIFFERENT passages.
+  - "reasoning": briefly explain how the facts connect to your answer. KEEP THIS TO 1-2 SENTENCES MAX to save time.
   - "supporting_fact_numbers": list ALL fact numbers that support your answer based on AVAILABLE FACTS.
   - "answer": short and direct (a few words). For yes/no questions, answer "yes" or "no" (lowercase).
   - You MUST provide an answer using the available facts. Even if you only have partial evidence, give your best logical guess.
