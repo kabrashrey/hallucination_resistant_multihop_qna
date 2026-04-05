@@ -556,10 +556,6 @@ class Generator:
         if answer_lower in ('yes', 'no', 'noanswer', 'yes.', 'no.'):
             answer = answer_lower.rstrip('.')
 
-        # Strip leading "the " for short entity answers
-        if answer.lower().startswith('the ') and len(answer.split()) <= 4:
-            answer = answer[4:]
-
         return answer.strip()
 
     def _validate_citations(

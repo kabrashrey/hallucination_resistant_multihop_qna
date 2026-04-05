@@ -54,7 +54,7 @@ retriever:
     max_bridge_entities: 3 # max entities extracted per hop for query reformulation
     hop2_strategy: "both" # "title" (B), "concat" (legacy), "both" (B+D)
     llm_decompose_confidence_threshold: 0.3 # trigger LLM decomposition below this hop-1 confidence
-    llm_decompose_ollama_model: "qwen2.5:7b"
+    llm_decompose_ollama_model: "qwen3:8b"
     extraction_temperature: 0.0 # LLM temperature for bridge entity extraction
     extraction_timeout: 120 # Web request timeout for local LLM / Anthropic during entity extraction
 
@@ -77,7 +77,7 @@ reranker:
 
   sentence_score_threshold: 0.4 # Minimum cosine sim to select a sentence as evidence
   max_sentences_per_passage: 5 # Max sentences to extract from any single passage
-  sentence_passage_limit: 5 # Only select sentences from top N reranked passages
+  sentence_passage_limit: 3 # Only select sentences from top N reranked passages
   title_overlap_boost: 0.05 # Additive boost to cosine sim if passage title shares words with query
 
   # Batch size for cross-encoder inference
@@ -88,7 +88,7 @@ prompt_builder:
   include_passage_numbers: true
   include_sentence_indices: true
   evidence_first: true # Context before question or Question before Context
-  max_evidence_chars: 8000 # Max characters before trunkating the prompt (for context limits)
+  max_evidence_chars: 6000 # Max characters before trunkating the prompt (for context limits)
   bridge_keywords:
     [
       "who",
@@ -114,13 +114,13 @@ prompt_builder:
 
   # LLM temperatures
   temperature_small_model: 0.1 # for simple queries
-  temperature_large_model: 0.3 # for complex queries
+  temperature_large_model: 0.2 # for complex queries
 
 # --- Generator ---
 generator:
   ollama_base_url: "http://localhost:11434"
-  model_small: "llama3.2:latest"
-  model_large: "qwen3:8b"
+  model_small: "gemma3:12b" # upgraded from llama3.2 (3B) — better JSON compliance
+  model_large: "qwen3:32b" # upgraded from qwen3:8b — best reasoning at this tier (A100 80GB)
   request_timeout: 300
   validate_citations: true
   retry_on_parse_failure: true

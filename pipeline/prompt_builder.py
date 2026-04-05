@@ -102,7 +102,9 @@ class PromptBuilder:
             passage = result.passage
             lines.append(f"Passage {passage_idx}: [{passage.title}]")
 
-            for sent_str, sent_idx in zip(result.supporting_sentences[:3], result.supporting_sentence_indices[:3]):
+            # Rank-aware: top-2 passages get 3 sentences, rest get 2
+            max_sents = 3 if passage_idx < 2 else 2
+            for sent_str, sent_idx in zip(result.supporting_sentences[:max_sents], result.supporting_sentence_indices[:max_sents]):
                 display_sent = sent_str[:180] + "..." if len(sent_str) > 180 else sent_str
                 lines.append(f"  [{sent_idx}] {display_sent}")
 
@@ -161,9 +163,11 @@ class PromptBuilder:
         fact_mapping = {}  # fact_number -> (title, sentence_idx)
         fact_number = 0
 
-        for _, result in enumerate(results):
+        for passage_idx, result in enumerate(results):
             passage = result.passage
-            for sent_str, sent_idx in list(zip(result.supporting_sentences, result.supporting_sentence_indices))[:3]:
+            # Rank-aware: top-2 passages get 3 facts, rest get 2
+            max_facts = 3 if passage_idx < 2 else 2
+            for sent_str, sent_idx in list(zip(result.supporting_sentences, result.supporting_sentence_indices))[:max_facts]:
                 display_sent = sent_str[:180] + "..." if len(sent_str) > 180 else sent_str
                 lines.append(f"Fact {fact_number}: [{passage.title}, {sent_idx}] {display_sent}")
                 fact_mapping[fact_number] = (passage.title, sent_idx)
