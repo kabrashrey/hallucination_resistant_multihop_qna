@@ -539,9 +539,17 @@ class Generator:
             r'^The answer is:?\s*',
             r'^Answer:?\s*',
             r'^From the evidence,?\s*',
+            # Filler patterns: "It is X" -> "X", "There are X" -> "X"
+            r'^(?:It|This)\s+(?:is|was|appears to be|seems to be)\s+',
+            r'^There\s+(?:is|are|was|were)\s+',
         ]
         for pattern in preamble_patterns:
             answer = re.sub(pattern, '', answer, flags=re.IGNORECASE)
+
+        # Strip leading articles for short answers (≤ 5 words)
+        # "the Chief of Protocol" -> "Chief of Protocol" (only if short)
+        if len(answer.split()) <= 5:
+            answer = re.sub(r'^(?:the|a|an)\s+', '', answer, flags=re.IGNORECASE)
 
         # Remove trailing periods from short answers (common LLM habit)
         if len(answer.split()) <= 5 and answer.endswith('.'):

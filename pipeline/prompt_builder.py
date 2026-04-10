@@ -42,6 +42,7 @@ class PromptBuilder:
         reranked_results: List[RerankResult],
         include_metadata: bool = True,
         use_citation_selection: bool = True,
+        question_type: str = "",
     ) -> PromptBuilderOutput:
         if not reranked_results:
             raise ValueError("No reranked results provided")
@@ -62,9 +63,12 @@ class PromptBuilder:
         target_model = "complex" if complexity_score > threshold else "simple"
 
         if use_citation_selection:
-            instructions = self._build_instructions(query, facts_list_str=facts_list_str, fact_mapping=fact_mapping)
+            instructions = self._build_instructions(
+                query, facts_list_str=facts_list_str, fact_mapping=fact_mapping,
+                question_type=question_type,
+            )
         else:
-            instructions = self._build_instructions(query)
+            instructions = self._build_instructions(query, question_type=question_type)
 
         if self.cfg.evidence_first:
             prompt = f"{evidence_block}\n\n{instructions}"
@@ -174,8 +178,31 @@ class PromptBuilder:
                 fact_number += 1
         return "\n".join(lines), fact_mapping
 
-    def _build_instructions(self, query: str, facts_list_str: str = "", fact_mapping: Dict = None) -> str:
+    def _is_yesno_question(self, query: str, question_type: str = "") -> bool:
+        """Detect yes/no questions via metadata and syntax heuristics."""
+        # HotpotQA comparison type often (but not always) maps to yes/no
+        if question_type == "comparison":
+            return True
+        # Syntax-based detection: questions starting with boolean indicators
+        q_lower = query.strip().lower()
+        yesno_starters = (
+            "is ", "are ", "was ", "were ", "did ", "does ", "do ",
+            "has ", "have ", "had ", "can ", "could ", "will ", "would ",
+            "should ", "shall ",
+        )
+        return q_lower.startswith(yesno_starters)
+
+    def _build_instructions(self, query: str, facts_list_str: str = "",
+                            fact_mapping: Dict = None, question_type: str = "") -> str:
+        is_yesno = self._is_yesno_question(query, question_type)
+
         if fact_mapping is not None and facts_list_str:
+            # Yes/No questions get a specialized prompt for boolean reasoning
+            if is_yesno and self.prompts and self.prompts.builder_citation_yesno:
+                log.info("Using yes/no specialized prompt")
+                return self.prompts.builder_citation_yesno.format(
+                    query=query, facts_list_str=facts_list_str
+                )
             # Citation selection approach
             if self.prompts and self.prompts.builder_citation:
                 return self.prompts.builder_citation.format(query=query, facts_list_str=facts_list_str)

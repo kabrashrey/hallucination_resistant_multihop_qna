@@ -13,6 +13,7 @@ from pipeline.indexer import HybridRetriever
 from pipeline.reranker import Reranker
 from pipeline.prompt_builder import PromptBuilder
 from pipeline.generator import Generator
+from pipeline.verifier import Verifier
 from scripts.config import load_config
 from scripts.logger import get_logger
 
@@ -67,10 +68,15 @@ def build_pipeline(cfg):
     log.info("Initializing generator...")
     gen = Generator.from_config(cfg)
 
-    return eval_examples, retriever, reranker, pb, gen, cfg
+    verifier = None
+    if getattr(cfg.verifier, "enabled", False):
+        log.info("Initializing verifier...")
+        verifier = Verifier.from_config(cfg)
+
+    return eval_examples, retriever, reranker, pb, gen, verifier, cfg
 
 
-def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[int] = None):
+def run_pipeline(examples, retriever, reranker, pb, gen, verifier, cfg, limit: Optional[int] = None):
     predictions = {}
 
     if limit:
@@ -78,6 +84,7 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
 
     # Stage-by-stage recall diagnostics
     diag = {"retrieval": [], "rerank": [], "sentence": [], "prediction": []}
+    verification_stats = {"scores": [], "supported": 0, "unsupported": 0, "skipped": 0}
 
     reranker_top_k = getattr(cfg.reranker, 'top_k', 7)
 
@@ -117,31 +124,89 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
                             break
             sentence_recall = len(gold_facts & selected_facts) / len(gold_facts) if gold_facts else 0.0
 
-            pb_output = pb.build(ex.question, reranked, use_citation_selection=True)
+            pb_output = pb.build(ex.question, reranked, use_citation_selection=True,
+                                 question_type=ex.question_type)
             full_response = ""
-            try:
-                gen_output = gen.generate(
-                    prompt=pb_output.prompt,
-                    target_model=pb_output.target_model,
-                    temperature=(
-                        cfg.prompt_builder.temperature_large_model
-                        if pb_output.target_model == "complex"
-                        else cfg.prompt_builder.temperature_small_model
-                    ),
-                    supporting_fact_indices=pb_output.supporting_fact_indices,
-                    fact_mapping=pb_output.fact_mapping,
-                )
-                answer = gen_output.answer
-                supporting_facts = gen_output.supporting_facts
-                full_response = gen_output.full_response
-            except Exception as e:
-                log.warning(f"Generation failed for {ex.id}: {e}")
-                answer = "Cannot answer based on the provided evidence."
-                supporting_facts = []
+            answer = ""
+            supporting_facts = []
+
+            # Verification retry config
+            retry_enabled = (
+                verifier is not None
+                and getattr(cfg.verifier, 'retry_on_failure', False)
+            )
+            max_retries = int(getattr(cfg.verifier, 'max_verification_retries', 1)) if retry_enabled else 0
+            retry_threshold = float(getattr(cfg.verifier, 'retry_score_threshold', 0.4))
+
+            for attempt in range(1 + max_retries):
+                try:
+                    current_prompt = pb_output.prompt
+                    # On retry, prepend feedback to nudge the LLM toward evidence-grounded answers
+                    if attempt > 0 and answer:
+                        feedback = (
+                            f"Your previous answer \"{answer}\" was not well-supported by the evidence. "
+                            f"Re-read the facts carefully and provide a better-grounded answer. "
+                            f"Extract the answer directly from the facts.\n\n"
+                        )
+                        current_prompt = feedback + current_prompt
+                        log.info(f"Verification retry {attempt} for {ex.id} (prev answer: '{answer}')")
+
+                    gen_output = gen.generate(
+                        prompt=current_prompt,
+                        target_model=pb_output.target_model,
+                        temperature=(
+                            cfg.prompt_builder.temperature_large_model
+                            if pb_output.target_model == "complex"
+                            else cfg.prompt_builder.temperature_small_model
+                        ),
+                        supporting_fact_indices=pb_output.supporting_fact_indices,
+                        fact_mapping=pb_output.fact_mapping,
+                    )
+                    answer = gen_output.answer
+                    supporting_facts = gen_output.supporting_facts
+                    full_response = gen_output.full_response
+
+                    # Check verification — break early if supported or last attempt
+                    if retry_enabled and verifier is not None and attempt < max_retries:
+                        vr = verifier.verify(
+                            answer=answer,
+                            evidence=reranked,
+                            supporting_facts=supporting_facts,
+                        )
+                        if vr.is_supported or vr.support_score >= retry_threshold:
+                            break  # Answer is good enough, no retry needed
+                        # Otherwise loop continues with retry
+                    else:
+                        break
+
+                except Exception as e:
+                    log.warning(f"Generation failed for {ex.id} (attempt {attempt+1}): {e}")
+                    answer = "Cannot answer based on the provided evidence."
+                    supporting_facts = []
+                    break
 
             # Diagnostic: prediction recall
             pred_facts = {(sf[0], sf[1]) for sf in supporting_facts} if supporting_facts else set()
             pred_recall = len(gold_facts & pred_facts) / len(gold_facts) if gold_facts else 0.0
+
+            # --- Final Verification (for diagnostics) ---
+            verification_result = None
+            if verifier is not None:
+                try:
+                    vr = verifier.verify(
+                        answer=answer,
+                        evidence=reranked,
+                        supporting_facts=supporting_facts,
+                    )
+                    verification_result = {
+                        "support_score": vr.support_score,
+                        "is_supported": vr.is_supported,
+                        "unsupported_claims": vr.unsupported_claims,
+                        "evidence_count": vr.evidence_count,
+                        "metadata": vr.metadata,
+                    }
+                except Exception as e:
+                    log.warning(f"Verification failed for {ex.id}: {e}")
 
             return ex.id, {
                 "question": ex.question,
@@ -149,6 +214,7 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
                 "answer": answer,
                 "sp": supporting_facts,
                 "full_response": full_response,
+                "verification": verification_result,
             }, {
                 "retrieval": retrieval_recall,
                 "rerank": rerank_recall,
@@ -175,6 +241,16 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
             predictions[ex_id] = pred
             for stage in diag:
                 diag[stage].append(ex_diag[stage])
+            # Track verification stats
+            vr = pred.get("verification")
+            if vr is not None:
+                verification_stats["scores"].append(vr["support_score"])
+                if vr["is_supported"]:
+                    verification_stats["supported"] += 1
+                else:
+                    verification_stats["unsupported"] += 1
+            else:
+                verification_stats["skipped"] += 1
 
     # Summary stats
     empty_sp = sum(1 for p in predictions.values() if not p["sp"])
@@ -192,6 +268,20 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
             perfect = sum(1 for v in values if v >= 1.0)
             zero = sum(1 for v in values if v <= 0.0)
             log.info(f"  {stage:>12s}: mean={mean_val:.1%}  perfect={perfect}/{n}  zero={zero}/{n}")
+        log.info(f"{'='*60}")
+
+    # Verification diagnostics
+    v_scores = verification_stats["scores"]
+    if v_scores:
+        mean_vs = sum(v_scores) / len(v_scores)
+        log.info(f"\n{'='*60}")
+        log.info(f"VERIFICATION DIAGNOSTICS (n={len(v_scores)})")
+        log.info(f"{'='*60}")
+        log.info(f"  Mean support score: {mean_vs:.4f}")
+        log.info(f"  Supported:   {verification_stats['supported']}/{len(v_scores)} ({verification_stats['supported']/len(v_scores):.1%})")
+        log.info(f"  Unsupported: {verification_stats['unsupported']}/{len(v_scores)} ({verification_stats['unsupported']/len(v_scores):.1%})")
+        if verification_stats["skipped"]:
+            log.info(f"  Skipped:     {verification_stats['skipped']}")
         log.info(f"{'='*60}")
 
     return predictions
@@ -288,9 +378,9 @@ def main():
     log.info(f"Output: {args.output}")
     log.info(f"{'='*80}")
 
-    examples, retriever, reranker, pb, gen, cfg = build_pipeline(cfg)
+    examples, retriever, reranker, pb, gen, verifier, cfg = build_pipeline(cfg)
 
-    predictions = run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit=args.limit)
+    predictions = run_pipeline(examples, retriever, reranker, pb, gen, verifier, cfg, limit=args.limit)
 
     save_predictions(predictions, args.output)
 

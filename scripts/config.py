@@ -34,6 +34,7 @@ class PromptsConfig:
     builder_citation: str = ""
     builder_standard: str = ""
     generator_specialist: str = ""
+    builder_citation_yesno: str = ""
 
 @dataclass
 class MultihopConfig:
@@ -66,7 +67,7 @@ class RetrieverConfig:
 @dataclass
 class RerankerConfig:
     model_name: str = "BAAI/bge-reranker-v2-m3"
-    sentence_model_name: str = "nomic-embed-text"
+    sentence_model_name: str = "qwen3-embedding:8b"
     device: str = field(default_factory=get_best_device)
     top_k: int = 5                        
     sentence_score_threshold: float = 0.4 
@@ -82,7 +83,7 @@ class PromptBuilderConfig:
     include_passage_numbers: bool = True       
     include_sentence_indices: bool = True      
     evidence_first: bool = True                
-    max_evidence_chars: int = 12000
+    max_evidence_chars: int = 6000
     bridge_keywords: list = field(default_factory=lambda: ["who", "which", "when", "where", "what", "how", "portrayed", "actor", "character", "played"])             
 
     complexity_length_weight: float = 0.10
@@ -93,19 +94,37 @@ class PromptBuilderConfig:
     complexity_sentence_threshold: int = 5     
     complexity_routing_threshold: float = 0.50  
 
-    temperature_small_model: float = 0.2       
-    temperature_large_model: float = 0.4       
+    temperature_small_model: float = 0.1       
+    temperature_large_model: float = 0.2       
 
 
 @dataclass
 class GeneratorConfig:
     ollama_base_url: str = "http://localhost:11434"
-    model_small: str = "llama3.2:1b"
-    model_large: str = "qwen3:8b"
+    model_small: str = "gemma3:12b"
+    model_large: str = "qwen3:32b"
     request_timeout: int = 300
     validate_citations: bool = True
     retry_on_parse_failure: bool = True
     specialist_mode: bool = False
+
+
+@dataclass
+class VerifierConfig:
+    enabled: bool = True
+    retry_on_failure: bool = True
+    max_verification_retries: int = 1
+    retry_score_threshold: float = 0.4
+    mode: str = "overlap"  # "overlap", "nli", or "qa"
+    support_threshold: float = 0.55
+    claim_threshold: float = 0.45
+    min_supported_claim_ratio: float = 1.0
+    max_claims: int = 6
+    nli_model_name: str = "roberta-large-mnli"
+    nli_device: int = -1
+    qa_model_name: str = "distilbert-base-cased-distilled-squad"
+    qa_device: int = -1
+    qa_min_answer_score: float = 0.2
 
 
 @dataclass
@@ -123,6 +142,7 @@ class Config:
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
     prompt_builder: PromptBuilderConfig = field(default_factory=PromptBuilderConfig)
     generator: GeneratorConfig = field(default_factory=GeneratorConfig)
+    verifier: VerifierConfig = field(default_factory=VerifierConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     prompts: PromptsConfig = field(default_factory=PromptsConfig)
 
@@ -215,6 +235,9 @@ def load_config(path: Union[str, Path, None] = None) -> Config:
 
     if "generator" in raw:
         cfg.generator = _dict_to_dataclass(GeneratorConfig, raw["generator"])
+
+    if "verifier" in raw:
+        cfg.verifier = _dict_to_dataclass(VerifierConfig, raw["verifier"])
 
     if "eval" in raw:
         cfg.eval = _dict_to_dataclass(EvalConfig, raw["eval"])

@@ -223,6 +223,7 @@ class HybridRetriever:
         max_bridge_entities: int = 3,
         extraction_temperature: float = 0.0,
         extraction_timeout: int = 120,
+        confidence_threshold: float = 0.3,
     ):
         self.extraction_model = extraction_model
         self.ollama_base_url = ollama_base_url
@@ -235,6 +236,7 @@ class HybridRetriever:
         self.max_bridge_entities = max_bridge_entities
         self.extraction_temperature = extraction_temperature
         self.extraction_timeout = extraction_timeout
+        self._confidence_threshold = confidence_threshold
 
         self.bm25 = BM25Retriever()
         self.dense = DenseRetriever(
@@ -270,6 +272,7 @@ class HybridRetriever:
             max_bridge_entities=r.multihop.max_bridge_entities,
             extraction_temperature=getattr(r.multihop, "extraction_temperature", 0.0),
             extraction_timeout=getattr(r.multihop, "extraction_timeout", 120),
+            confidence_threshold=getattr(r.multihop, "llm_decompose_confidence_threshold", 0.3),
         )
 
     def _get_alpha(self, question_type: Optional[str] = None) -> float:
@@ -459,8 +462,7 @@ class HybridRetriever:
             ))
         return results
 
-    @staticmethod
-    def _extract_bridge_entities(passage: Passage, question: str) -> List[str]:
+    def _extract_bridge_entities(self, passage: Passage, question: str) -> List[str]:
         """
         Extract potential bridge entities from a passage that could be used for hop 2
 
@@ -600,6 +602,10 @@ class HybridRetriever:
                  reformulate query = question + bridge entities, retrieve again
           Finally: merge, deduplicate, re-rank results from all hops
 
+        Adaptive behavior:
+          - Comparison questions skip hop-2 entirely (both entities are explicit)
+          - Bridge questions gate hop-2 on hop-1 confidence to avoid noise
+
         query: the original question
         hops: number of retrieval iterations (default 2 for bridge questions)
         top_k: total results to return after merging
@@ -607,16 +613,19 @@ class HybridRetriever:
         question_type: "bridge" or "comparison"
 
         Returns: deduplicated, re-ranked RetrievalResult list
-
-        Eg for "What position was held by the woman who portrayed Corliss Archer?":
-          Hop 1 query: "What position was held by the woman who portrayed Corliss Archer?"
-          Hop 1 finds: "Kiss and Tell" passage --> mentions "Shirley Temple"
-          Hop 2 query: "What position was held by the woman who portrayed Corliss Archer? Shirley Temple"
-          Hop 2 finds: "Shirley Temple" passage --> mentions "Chief of Protocol"
         """
+        # Comparison questions: both entities are explicit in the query.
+        # Hop-2 adds noise from LLM entity extraction without retrieval benefit.
+        if question_type == "comparison":
+            log.info(f"Comparison question — single-hop retrieval (skipping hop-2)")
+            return self.retrieve(query, top_k=top_k, question_type=question_type)
+
         all_results: List[RetrievalResult] = []
         seen_keys: set = set()
         current_query = query
+
+        # Confidence threshold for gating hop-2 (from config)
+        confidence_threshold = getattr(self, '_confidence_threshold', 0.3)
 
         for hop in range(hops):
             hop_results = self.retrieve(current_query, top_k=top_k_per_hop,
@@ -638,6 +647,11 @@ class HybridRetriever:
                     new_in_hop += 1
                     all_results.append(r)
                 top_passages_for_extraction.append(r.passage)
+
+            # Adaptive: skip hop-2 if hop-1 is already confident (avoids noise)
+            if hop == 0 and hop_confidence > confidence_threshold:
+                log.info(f"Hop-1 confidence {hop_confidence:.3f} > threshold {confidence_threshold} — skipping hop-2")
+                break
 
             # Extract bridge entities using LLM
             bridge_entities = []

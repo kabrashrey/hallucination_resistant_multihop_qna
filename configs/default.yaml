@@ -126,6 +126,18 @@ generator:
   retry_on_parse_failure: true
   specialist_mode: false # true: model_large selects facts, model_small answers
 
+# --- Verifier (post-generation hallucination check) ---
+verifier:
+  enabled: true
+  retry_on_failure: true # Re-generate answer if verification fails
+  max_verification_retries: 1 # Max retry attempts (1 = original + 1 retry)
+  retry_score_threshold: 0.4 # Only retry if support_score < this (avoid retrying marginal cases)
+  mode: "overlap" # "overlap" (no extra deps), "nli" (needs transformers), "qa" (needs transformers)
+  support_threshold: 0.55 # overall support score needed to mark answer as supported
+  claim_threshold: 0.45 # per-claim score needed
+  min_supported_claim_ratio: 1.0 # fraction of claims that must be supported (1.0 = all)
+  max_claims: 6
+
 # --- Evaluation ---
 eval:
   # How many examples to evaluate on (null = all)

@@ -85,3 +85,33 @@ generator_specialist: |
     BAD: 'The film was released in 2005' GOOD: '2005'
 
   Respond with ONLY JSON: {{"answer": "your answer"}}
+
+builder_citation_yesno: |
+  QUESTION: {query}
+
+  {facts_list_str}
+
+  TASK: This is a YES/NO question. Determine the answer using ONLY the available facts. Think step by step.
+
+  RESPOND WITH THIS JSON FORMAT - NOTHING ELSE:
+  {{
+    "supporting_fact_numbers": [0, 1, 3],
+    "answer": "yes"
+  }}
+
+  EXAMPLES:
+  Q: Are both films directed by the same person?
+  Fact 0: "Film A was directed by James Cameron." Fact 1: "Film B was directed by Ridley Scott."
+  {{"supporting_fact_numbers": [0, 1], "answer": "no"}}
+
+  Q: Is the city where the university is located also the state capital?
+  Fact 2: "The university is in Austin, Texas." Fact 5: "Austin is the capital of Texas."
+  {{"supporting_fact_numbers": [2, 5], "answer": "yes"}}
+
+  RULES:
+  - Output ONLY raw valid JSON. Do NOT wrap it in markdown backticks.
+  - "answer" MUST be exactly "yes" or "no" (lowercase). No other response is acceptable.
+  - "supporting_fact_numbers": list ALL fact numbers that you used to reach your conclusion.
+  - Compare, contrast, or evaluate the facts to determine the boolean answer.
+  - You MUST provide an answer. Even with partial evidence, make your best logical judgment.
+  - NEVER output "Cannot determine from evidence", always commit to "yes" or "no".
