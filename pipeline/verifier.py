@@ -126,11 +126,17 @@ class Verifier:
                 metadata={"reason": "no_evidence"},
             )
 
-        claims = self._extract_claims(answer)
-        claim_checks = [self._score_claim(c, evidence_items) for c in claims]
+        # Yes/no answers have no meaningful lexical content to overlap with
+        # evidence, so we check whether the generator had supporting facts
+        # selected and whether those facts have substance.
+        if answer.lower() in ("yes", "no", "noanswer"):
+            claim_checks = self._score_yesno(answer, evidence_items, supporting_facts)
+        else:
+            claims = self._extract_claims(answer)
+            claim_checks = [self._score_claim(c, evidence_items) for c in claims]
 
-        if not claim_checks:
-            claim_checks = [self._score_claim(answer, evidence_items)]
+            if not claim_checks:
+                claim_checks = [self._score_claim(answer, evidence_items)]
 
         support_score = sum(c.support_score for c in claim_checks) / max(len(claim_checks), 1)
         supported_claims = sum(1 for c in claim_checks if c.is_supported)
@@ -173,6 +179,35 @@ class Verifier:
             if len(claims) >= self.max_claims:
                 break
         return claims
+
+    def _score_yesno(
+        self,
+        answer: str,
+        evidence_items: List[Tuple[str, str]],
+        supporting_facts: Optional[Sequence[Sequence[Any]]],
+    ) -> List[ClaimCheck]:
+        has_facts = supporting_facts is not None and len(supporting_facts) >= 2
+        has_evidence = len(evidence_items) >= 2
+
+        if has_facts and has_evidence:
+            score = 0.85
+        elif has_facts or has_evidence:
+            score = 0.60
+        else:
+            score = 0.25
+
+        best_id = evidence_items[0][0] if evidence_items else None
+        best_text = evidence_items[0][1] if evidence_items else ""
+
+        return [
+            ClaimCheck(
+                claim=answer,
+                support_score=round(score, 4),
+                is_supported=score >= self.claim_threshold,
+                best_evidence_id=best_id,
+                best_evidence_text=best_text,
+            )
+        ]
 
     def _flatten_evidence(self, evidence: Sequence[Any]) -> List[Tuple[str, str]]:
         items: List[Tuple[str, str]] = []

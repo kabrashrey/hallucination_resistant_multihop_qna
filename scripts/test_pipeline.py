@@ -88,7 +88,7 @@ def test_single_example():
         evidence=reranked,
         supporting_facts=gen_output.supporting_facts,
     )
-    log.info(f"Verifier backend: {verify_result.metadata.get('backend')}")
+    log.info(f"Verifier mode: {verify_result.metadata.get('mode')}")
     log.info(f"Support score: {verify_result.support_score:.4f}")
     log.info(f"Is supported: {verify_result.is_supported}")
     log.info(f"Unsupported claims: {verify_result.unsupported_claims}")
