@@ -88,6 +88,7 @@ We focus primarily on the HotpotQA dataset, which contains multi-hop questions w
    ollama pull nomic-embed-text
    ollama pull llama3.2:1b
    ollama pull qwen3:8b
+   ollama pull qwen3-embedding:8b
    ```
 
 ## Pipeline Architecture

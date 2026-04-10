@@ -459,8 +459,7 @@ class HybridRetriever:
             ))
         return results
 
-    @staticmethod
-    def _extract_bridge_entities(passage: Passage, question: str) -> List[str]:
+    def _extract_bridge_entities(self, passage: Passage, question: str) -> List[str]:
         """
         Extract potential bridge entities from a passage that could be used for hop 2
 
