@@ -13,6 +13,8 @@ from pipeline.indexer import HybridRetriever
 from pipeline.reranker import Reranker
 from pipeline.prompt_builder import PromptBuilder
 from pipeline.generator import Generator
+from pipeline.verifier import Verifier
+from pipeline.decider import Decider
 from scripts.config import load_config
 from scripts.logger import get_logger
 
@@ -67,10 +69,16 @@ def build_pipeline(cfg):
     log.info("Initializing generator...")
     gen = Generator.from_config(cfg)
 
-    return eval_examples, retriever, reranker, pb, gen, cfg
+    log.info("Initializing verifier...")
+    verifier = Verifier.from_config(cfg)
+
+    log.info("Initializing decider...")
+    decider = Decider()
+
+    return eval_examples, retriever, reranker, pb, gen, verifier, decider, cfg
 
 
-def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[int] = None):
+def run_pipeline(examples, retriever, reranker, pb, gen, verifier, decider, cfg, limit: Optional[int] = None):
     predictions = {}
 
     if limit:
@@ -80,6 +88,10 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
     diag = {"retrieval": [], "rerank": [], "sentence": [], "prediction": []}
 
     reranker_top_k = getattr(cfg.reranker, 'top_k', 7)
+    base_top_k = 20
+    base_top_k_per_hop = getattr(cfg.retriever.multihop, "top_k_per_hop", 5)
+    retry_top_k = base_top_k * 2
+    retry_top_k_per_hop = base_top_k_per_hop * 2
 
     def process_example(ex):
         try:
@@ -87,73 +99,112 @@ def run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit: Optional[in
             gold_titles = {sf.title for sf in ex.supporting_facts}
             gold_facts = {(sf.title, sf.sentence_index) for sf in ex.supporting_facts}
 
-            retrieved = retriever.retrieve_multihop(
-                ex.question, hops=2, top_k=20, question_type=ex.question_type
-            )
+            def run_attempt(top_k: int, top_k_per_hop: int):
+                retrieved = retriever.retrieve_multihop(
+                    ex.question,
+                    hops=cfg.retriever.multihop.hops,
+                    top_k=top_k,
+                    top_k_per_hop=top_k_per_hop,
+                    question_type=ex.question_type,
+                )
 
-            if not retrieved:
+                if not retrieved:
+                    return None
+
+                retrieved_titles = {r.passage.title for r in retrieved}
+                retrieval_recall = len(gold_titles & retrieved_titles) / len(gold_titles) if gold_titles else 0.0
+
+                reranked = reranker.rerank(ex.question, retrieved, top_k=reranker_top_k, select_sentences=True)
+
+                reranked_titles = {r.passage.title for r in reranked}
+                rerank_recall = len(gold_titles & reranked_titles) / len(gold_titles) if gold_titles else 0.0
+
+                selected_facts = set()
+                for r in reranked:
+                    for sent_str in r.supporting_sentences:
+                        for idx, s in enumerate(r.passage.sentences):
+                            if " ".join(s.split()) == " ".join(sent_str.split()) or " ".join(s.split()).startswith(" ".join(sent_str.split())[:50]):
+                                selected_facts.add((r.passage.title, idx))
+                                break
+                sentence_recall = len(gold_facts & selected_facts) / len(gold_facts) if gold_facts else 0.0
+
+                pb_output = pb.build(ex.question, reranked, use_citation_selection=True)
+                full_response = ""
+                try:
+                    gen_output = gen.generate(
+                        prompt=pb_output.prompt,
+                        target_model=pb_output.target_model,
+                        temperature=(
+                            cfg.prompt_builder.temperature_large_model
+                            if pb_output.target_model == "complex"
+                            else cfg.prompt_builder.temperature_small_model
+                        ),
+                        supporting_fact_indices=pb_output.supporting_fact_indices,
+                        fact_mapping=pb_output.fact_mapping,
+                    )
+                    answer = gen_output.answer
+                    supporting_facts = gen_output.supporting_facts
+                    full_response = gen_output.full_response
+                except Exception as e:
+                    log.warning(f"Generation failed for {ex.id}: {e}")
+                    answer = "Cannot answer based on the provided evidence."
+                    supporting_facts = []
+
+                pred_facts = {(sf[0], sf[1]) for sf in supporting_facts} if supporting_facts else set()
+                pred_recall = len(gold_facts & pred_facts) / len(gold_facts) if gold_facts else 0.0
+
+                return {
+                    "answer": answer,
+                    "supporting_facts": supporting_facts,
+                    "full_response": full_response,
+                    "reranked_results": reranked,
+                    "retrieval": retrieval_recall,
+                    "rerank": rerank_recall,
+                    "sentence": sentence_recall,
+                    "prediction": pred_recall,
+                }
+
+            attempt = run_attempt(base_top_k, base_top_k_per_hop)
+            if not attempt:
                 return ex.id, {
                     "answer": "Cannot answer based on the provided evidence.",
                     "sp": [],
                 }, {"retrieval": 0.0, "rerank": 0.0, "sentence": 0.0, "prediction": 0.0}
 
-            # Diagnostic: retrieval recall
-            retrieved_titles = {r.passage.title for r in retrieved}
-            retrieval_recall = len(gold_titles & retrieved_titles) / len(gold_titles) if gold_titles else 0.0
+            verify_result = verifier.verify(
+                answer=attempt["answer"],
+                evidence=attempt["reranked_results"],
+                supporting_facts=attempt["supporting_facts"],
+            )
 
-            reranked = reranker.rerank(ex.question, retrieved, top_k=reranker_top_k, select_sentences=True)
+            def retry_fn():
+                log.info(f"Verifier rejected {ex.id}; retrying with expanded retrieval.")
+                retry_attempt = run_attempt(retry_top_k, retry_top_k_per_hop)
+                return retry_attempt
 
-            # Diagnostic: rerank recall
-            reranked_titles = {r.passage.title for r in reranked}
-            rerank_recall = len(gold_titles & reranked_titles) / len(gold_titles) if gold_titles else 0.0
-
-            # Diagnostic: sentence recall
-            selected_facts = set()
-            for r in reranked:
-                for sent_str in r.supporting_sentences:
-                    for idx, s in enumerate(r.passage.sentences):
-                        if " ".join(s.split()) == " ".join(sent_str.split()) or " ".join(s.split()).startswith(" ".join(sent_str.split())[:50]):
-                            selected_facts.add((r.passage.title, idx))
-                            break
-            sentence_recall = len(gold_facts & selected_facts) / len(gold_facts) if gold_facts else 0.0
-
-            pb_output = pb.build(ex.question, reranked, use_citation_selection=True)
-            full_response = ""
-            try:
-                gen_output = gen.generate(
-                    prompt=pb_output.prompt,
-                    target_model=pb_output.target_model,
-                    temperature=(
-                        cfg.prompt_builder.temperature_large_model
-                        if pb_output.target_model == "complex"
-                        else cfg.prompt_builder.temperature_small_model
-                    ),
-                    supporting_fact_indices=pb_output.supporting_fact_indices,
-                    fact_mapping=pb_output.fact_mapping,
-                )
-                answer = gen_output.answer
-                supporting_facts = gen_output.supporting_facts
-                full_response = gen_output.full_response
-            except Exception as e:
-                log.warning(f"Generation failed for {ex.id}: {e}")
-                answer = "Cannot answer based on the provided evidence."
-                supporting_facts = []
-
-            # Diagnostic: prediction recall
-            pred_facts = {(sf[0], sf[1]) for sf in supporting_facts} if supporting_facts else set()
-            pred_recall = len(gold_facts & pred_facts) / len(gold_facts) if gold_facts else 0.0
+            decision, attempt = decider.decide(
+                answer=attempt["answer"],
+                verification=verify_result,
+                reranked_results=attempt["reranked_results"],
+                supporting_facts=attempt["supporting_facts"],
+                verifier=verifier,
+                retry_fn=retry_fn,
+                attempt_metadata=attempt,
+            )
 
             return ex.id, {
                 "question": ex.question,
                 "gold_answer": ex.answer,
-                "answer": answer,
-                "sp": supporting_facts,
-                "full_response": full_response,
+                "answer": decision.answer,
+                "sp": attempt["supporting_facts"],
+                "supporting_passage_ids": decision.supporting_passage_ids,
+                "confidence": decision.confidence,
+                "full_response": attempt["full_response"],
             }, {
-                "retrieval": retrieval_recall,
-                "rerank": rerank_recall,
-                "sentence": sentence_recall,
-                "prediction": pred_recall
+                "retrieval": attempt["retrieval"],
+                "rerank": attempt["rerank"],
+                "sentence": attempt["sentence"],
+                "prediction": attempt["prediction"],
             }
         except Exception as e:
             log.error(f"Failed processing example {ex.id}: {e}")
@@ -288,9 +339,11 @@ def main():
     log.info(f"Output: {args.output}")
     log.info(f"{'='*80}")
 
-    examples, retriever, reranker, pb, gen, cfg = build_pipeline(cfg)
+    examples, retriever, reranker, pb, gen, verifier, decider, cfg = build_pipeline(cfg)
 
-    predictions = run_pipeline(examples, retriever, reranker, pb, gen, cfg, limit=args.limit)
+    predictions = run_pipeline(
+        examples, retriever, reranker, pb, gen, verifier, decider, cfg, limit=args.limit
+    )
 
     save_predictions(predictions, args.output)
 
