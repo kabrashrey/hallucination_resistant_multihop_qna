@@ -14,6 +14,7 @@ from pipeline.reranker import Reranker
 from pipeline.prompt_builder import PromptBuilder
 from pipeline.generator import Generator
 from pipeline.verifier import Verifier
+from pipeline.decider import Decider
 from scripts.config import load_config
 from scripts.logger import get_logger
 
@@ -73,10 +74,13 @@ def build_pipeline(cfg):
         log.info("Initializing verifier...")
         verifier = Verifier.from_config(cfg)
 
-    return eval_examples, retriever, reranker, pb, gen, verifier, cfg
+    log.info("Initializing decider...")
+    decider = Decider()
+
+    return eval_examples, retriever, reranker, pb, gen, verifier, decider, cfg
 
 
-def run_pipeline(examples, retriever, reranker, pb, gen, verifier, cfg, limit: Optional[int] = None):
+def run_pipeline(examples, retriever, reranker, pb, gen, verifier, decider, cfg, limit: Optional[int] = None):
     predictions = {}
 
     if limit:
@@ -189,32 +193,91 @@ def run_pipeline(examples, retriever, reranker, pb, gen, verifier, cfg, limit: O
             pred_facts = {(sf[0], sf[1]) for sf in supporting_facts} if supporting_facts else set()
             pred_recall = len(gold_facts & pred_facts) / len(gold_facts) if gold_facts else 0.0
 
-            # --- Final Verification (for diagnostics) ---
+            # --- Verification ---
             verification_result = None
+            vr_obj = None
             if verifier is not None:
                 try:
-                    vr = verifier.verify(
+                    vr_obj = verifier.verify(
                         answer=answer,
                         evidence=reranked,
                         supporting_facts=supporting_facts,
                     )
                     verification_result = {
-                        "support_score": vr.support_score,
-                        "is_supported": vr.is_supported,
-                        "unsupported_claims": vr.unsupported_claims,
-                        "evidence_count": vr.evidence_count,
-                        "metadata": vr.metadata,
+                        "support_score": vr_obj.support_score,
+                        "is_supported": vr_obj.is_supported,
+                        "unsupported_claims": vr_obj.unsupported_claims,
+                        "evidence_count": vr_obj.evidence_count,
+                        "metadata": vr_obj.metadata,
                     }
                 except Exception as e:
                     log.warning(f"Verification failed for {ex.id}: {e}")
 
+            # --- Decider: final answer decision ---
+            # Build a retry function for the decider (re-generates with feedback)
+            def make_retry_fn():
+                def retry_fn():
+                    try:
+                        feedback = (
+                            f"Your previous answer was not well-supported by the evidence. "
+                            f"Re-read the facts carefully and provide a better-grounded answer. "
+                            f"Extract the answer directly from the facts.\n\n"
+                        )
+                        retry_output = gen.generate(
+                            prompt=feedback + pb_output.prompt,
+                            target_model=pb_output.target_model,
+                            temperature=(
+                                cfg.prompt_builder.temperature_large_model
+                                if pb_output.target_model == "complex"
+                                else cfg.prompt_builder.temperature_small_model
+                            ),
+                            supporting_fact_indices=pb_output.supporting_fact_indices,
+                            fact_mapping=pb_output.fact_mapping,
+                        )
+                        return {
+                            "answer": retry_output.answer,
+                            "supporting_facts": retry_output.supporting_facts,
+                            "full_response": retry_output.full_response,
+                            "reranked_results": reranked,
+                        }
+                    except Exception as e:
+                        log.warning(f"Decider retry failed for {ex.id}: {e}")
+                        return None
+                return retry_fn
+
+            decision, attempt_data = decider.decide(
+                answer=answer,
+                verification=vr_obj,
+                reranked_results=reranked,
+                supporting_facts=supporting_facts,
+                verifier=verifier if retry_enabled else None,
+                retry_fn=make_retry_fn() if retry_enabled else None,
+                attempt_metadata={
+                    "full_response": full_response,
+                },
+            )
+
+            # Use decision output as final answer
+            final_answer = decision.answer
+            final_sp = attempt_data.get("supporting_facts", supporting_facts) or supporting_facts
+
+            # Update verification result if decider triggered a retry
+            if decision.support_score > 0 and verification_result:
+                verification_result["support_score"] = decision.support_score
+                verification_result["is_supported"] = decision.verifier_supported
+
             return ex.id, {
                 "question": ex.question,
                 "gold_answer": ex.answer,
-                "answer": answer,
-                "sp": supporting_facts,
-                "full_response": full_response,
+                "answer": final_answer,
+                "sp": final_sp,
+                "full_response": attempt_data.get("full_response", full_response),
                 "verification": verification_result,
+                "decision": {
+                    "confidence": decision.confidence,
+                    "verifier_supported": decision.verifier_supported,
+                    "supporting_passage_ids": decision.supporting_passage_ids,
+                },
             }, {
                 "retrieval": retrieval_recall,
                 "rerank": rerank_recall,
@@ -378,9 +441,9 @@ def main():
     log.info(f"Output: {args.output}")
     log.info(f"{'='*80}")
 
-    examples, retriever, reranker, pb, gen, verifier, cfg = build_pipeline(cfg)
+    examples, retriever, reranker, pb, gen, verifier, decider, cfg = build_pipeline(cfg)
 
-    predictions = run_pipeline(examples, retriever, reranker, pb, gen, verifier, cfg, limit=args.limit)
+    predictions = run_pipeline(examples, retriever, reranker, pb, gen, verifier, decider, cfg, limit=args.limit)
 
     save_predictions(predictions, args.output)
 

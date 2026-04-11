@@ -129,7 +129,7 @@ generator:
 # --- Verifier (post-generation hallucination check) ---
 verifier:
   enabled: true
-  retry_on_failure: true # Re-generate answer if verification fails
+  retry_on_failure: false # Disabled — retries hurt EM more than they help (see metrics comparison)
   max_verification_retries: 1 # Max retry attempts (1 = original + 1 retry)
   retry_score_threshold: 0.4 # Only retry if support_score < this (avoid retrying marginal cases)
   mode: "overlap" # "overlap" (no extra deps), "nli" (needs transformers), "qa" (needs transformers)
