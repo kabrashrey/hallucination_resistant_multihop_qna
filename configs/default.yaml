@@ -120,7 +120,7 @@ prompt_builder:
 generator:
   ollama_base_url: "http://localhost:11434"
   model_small: "gemma3:12b" # upgraded from llama3.2 (3B) — better JSON compliance
-  model_large: "qwen3:32b" # upgraded from qwen3:8b — best reasoning at this tier (A100 80GB)
+  model_large: "qwen2.5:72b" # upgraded from qwen3:8b — best reasoning at this tier (A100 80GB)
   request_timeout: 300
   validate_citations: true
   retry_on_parse_failure: true
