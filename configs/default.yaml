@@ -77,7 +77,7 @@ reranker:
 
   sentence_score_threshold: 0.4 # Minimum cosine sim to select a sentence as evidence
   max_sentences_per_passage: 5 # Max sentences to extract from any single passage
-  sentence_passage_limit: 3 # Only select sentences from top N reranked passages
+  sentence_passage_limit: 5 # Only select sentences from top N reranked passages
   title_overlap_boost: 0.05 # Additive boost to cosine sim if passage title shares words with query
 
   # Batch size for cross-encoder inference
