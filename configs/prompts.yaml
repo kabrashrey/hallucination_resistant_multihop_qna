@@ -15,7 +15,7 @@ builder_citation: |
 
   {facts_list_str}
 
-  TASK: Answer the question using ONLY the available facts. Think step by step.
+  TASK: Answer the question using ONLY the available facts. Think step by step, connecting facts from DIFFERENT passages to build your answer.
 
   RESPOND WITH THIS JSON FORMAT - NOTHING ELSE:
   {{
@@ -24,11 +24,18 @@ builder_citation: |
     "answer": "Short answer here"
   }}
 
+  EXAMPLE (multi-hop):
+  Q: Where is the headquarters of the company the singer worked for?
+  Fact 0: [Singer Bio, 0] John Smith worked as lead vocalist for Acme Records.
+  Fact 1: [Acme Records, 0] Acme Records is a record label headquartered in Nashville, Tennessee.
+  {{"reasoning": "Fact 0 links the singer to Acme Records. Fact 1 says Acme Records is headquartered in Nashville, Tennessee.", "supporting_fact_numbers": [0, 1], "answer": "Nashville, Tennessee"}}
+
   RULES:
   - Output ONLY raw valid JSON. Do NOT wrap it in markdown backticks (```json).
-  - "reasoning": briefly explain how the facts connect to your answer. KEEP THIS TO 1-2 SENTENCES MAX to save time.
-  - "supporting_fact_numbers": list ALL fact numbers that support your answer based on AVAILABLE FACTS.
-  - "answer": short and direct (a few words). For yes/no questions, answer "yes" or "no" (lowercase).
+  - "reasoning": briefly explain how the facts connect to your answer. KEEP THIS TO 1-2 SENTENCES MAX.
+  - "supporting_fact_numbers": list ALL fact numbers you used. You should typically cite 2-4 facts. Look for facts from DIFFERENT passages that chain together.
+  - "answer": short and direct (1-5 words). Extract the EXACT entity, name, number, or date from the facts.
+  - Use the MOST SPECIFIC answer. "Nashville, Tennessee" not "United States". "Chief of Protocol" not "government official". Exact numbers like "3,677" not "about 4,000".
   - You MUST provide an answer using the available facts. Even if you only have partial evidence, give your best logical guess.
   - NEVER output "Cannot determine from evidence", always make a prediction.
   - For 'who/which is older/larger/first' questions, answer with the ENTITY NAME.
