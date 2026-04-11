@@ -179,12 +179,27 @@ class PromptBuilder:
         return "\n".join(lines), fact_mapping
 
     def _is_yesno_question(self, query: str, question_type: str = "") -> bool:
-        """Detect yes/no questions via metadata and syntax heuristics."""
-        # HotpotQA comparison type often (but not always) maps to yes/no
-        if question_type == "comparison":
-            return True
-        # Syntax-based detection: questions starting with boolean indicators
+        """Detect yes/no questions via syntax heuristics.
+        
+        IMPORTANT: Do NOT assume all comparison questions are yes/no.
+        In HotpotQA, many comparison questions expect entity answers:
+          - "Which writer was from England?" → entity answer
+          - "Who is older, X or Y?" → entity answer
+          - "Are both X and Y from Z?" → yes/no answer
+        
+        Only route to yes/no when the syntax clearly indicates a boolean question.
+        """
         q_lower = query.strip().lower()
+        
+        # Entity-seeking questions are NEVER yes/no, even within comparison type
+        entity_starters = (
+            "which ", "who ", "what ", "where ", "when ", "how ",
+            "name ", "in which ",
+        )
+        if q_lower.startswith(entity_starters):
+            return False
+        
+        # Syntax-based detection: questions starting with boolean indicators
         yesno_starters = (
             "is ", "are ", "was ", "were ", "did ", "does ", "do ",
             "has ", "have ", "had ", "can ", "could ", "will ", "would ",
