@@ -73,7 +73,7 @@ reranker:
   device: "auto"
 
   # No. of passages kept after re-ranking (fed to prompt builder)
-  top_k: 5
+  top_k: 7
 
   sentence_score_threshold: 0.4 # Minimum cosine sim to select a sentence as evidence
   max_sentences_per_passage: 5 # Max sentences to extract from any single passage

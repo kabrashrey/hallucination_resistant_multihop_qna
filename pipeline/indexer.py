@@ -649,7 +649,7 @@ class HybridRetriever:
                 top_passages_for_extraction.append(r.passage)
 
             # Adaptive: skip hop-2 if hop-1 is already confident (avoids noise)
-            if hop == 0 and hop_confidence > confidence_threshold:
+            if hop == 0 and question_type != "bridge" and hop_confidence > confidence_threshold:
                 log.info(f"Hop-1 confidence {hop_confidence:.3f} > threshold {confidence_threshold} — skipping hop-2")
                 break
 
