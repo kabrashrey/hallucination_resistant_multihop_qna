@@ -63,21 +63,32 @@ class PromptBuilder:
         target_model = "complex" if complexity_score > threshold else "simple"
 
         if use_citation_selection:
+            # facts_list_str is injected directly into instructions via {facts_list_str}
             instructions = self._build_instructions(
                 query, facts_list_str=facts_list_str, fact_mapping=fact_mapping,
                 question_type=question_type,
             )
+            prompt = instructions
         else:
             instructions = self._build_instructions(query, question_type=question_type)
-
-        if self.cfg.evidence_first:
-            prompt = f"{evidence_block}\n\n{instructions}"
-        else:
-            prompt = f"{instructions}\n\n{evidence_block}"
+            if self.cfg.evidence_first:
+                prompt = f"{evidence_block}\n\n{instructions}"
+            else:
+                prompt = f"{instructions}\n\n{evidence_block}"
 
         if len(prompt) > self.cfg.max_evidence_chars:
             log.warning(f"Prompt too long ({len(prompt)} chars), truncating to {self.cfg.max_evidence_chars}")
-            prompt = prompt[:self.cfg.max_evidence_chars] + "\n[... truncated ...]"
+            # If we just do prompt[:8000], we chop off the critical JSON instructions at the end!
+            # Instead, we just cut out a chunk from the middle (the evidence)
+            excess = len(prompt) - self.cfg.max_evidence_chars
+            # Keep the start (where instructions start) and the end (where JSON format rules live)
+            # Find a safe place to cut
+            if use_citation_selection:
+                # Truncate the middle of the prompt (the facts)
+                half = self.cfg.max_evidence_chars // 2
+                prompt = prompt[:half - 50] + "\n\n... [EVIDENCE TRUNCATED TO FIT CONTEXT] ...\n\n" + prompt[-(half - 50):]
+            else:
+                prompt = prompt[:self.cfg.max_evidence_chars] + "\n[... truncated ...]"
 
         metadata = {} if not include_metadata else {
             "num_passages": num_passages,
