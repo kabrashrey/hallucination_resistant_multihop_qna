@@ -19,6 +19,7 @@ import faiss
 from typing import List, Optional, Tuple, Union
 from dataclasses import dataclass
 from rank_bm25 import BM25Okapi
+from rapidfuzz import fuzz, process as fz_process
 from pipeline.embedder import OllamaEmbedder
 from pipeline.data_loader import Passage
 from scripts.config import load_config, get_best_device
@@ -141,9 +142,9 @@ class BM25Retriever:
 class DenseRetriever:
     def __init__(
         self,
-        model_name: str = "nomic-embed-text",
+        model_name: str = "qwen3-embedding:8b",
         ollama_base_url: str = "http://localhost:11434",
-        batch_size: int = 64,
+        batch_size: int = 32,
         # legacy param kept so from_config() call sites don't break
         device: str = "auto",
     ):
@@ -209,21 +210,22 @@ class DenseRetriever:
 class HybridRetriever:
     def __init__(
         self,
-        embed_model: str = "nomic-embed-text",
+        embed_model: str = "qwen3-embedding:8b",
         ollama_base_url: str = "http://localhost:11434",
         extraction_model: str = "qwen3:8b",
         alpha: float = 0.7,
         alpha_bridge: Optional[float] = None,
         alpha_comparison: Optional[float] = None,
         rrf_k: int = 20,
-        candidate_pool_size: int = 100,
+        candidate_pool_size: int = 200,
         device: str = "auto",   # kept for API compat, unused (Ollama handles device)
-        batch_size: int = 64,
+        batch_size: int = 32,
         prompts=None,
-        max_bridge_entities: int = 3,
+        max_bridge_entities: int = 5,
         extraction_temperature: float = 0.0,
-        extraction_timeout: int = 120,
-        confidence_threshold: float = 0.3,
+        extraction_timeout: int = 1800,
+        confidence_threshold: float = 1.0,
+        fuzzy_title_threshold: int = 70,
     ):
         self.extraction_model = extraction_model
         self.ollama_base_url = ollama_base_url
@@ -237,6 +239,7 @@ class HybridRetriever:
         self.extraction_temperature = extraction_temperature
         self.extraction_timeout = extraction_timeout
         self._confidence_threshold = confidence_threshold
+        self._fuzzy_title_threshold = fuzzy_title_threshold
 
         self.bm25 = BM25Retriever()
         self.dense = DenseRetriever(
@@ -246,6 +249,8 @@ class HybridRetriever:
         )
         self._passages: List[Passage] = []
         self._texts: List[str] = []
+        self._title_list: List[str] = []
+        self._title_to_idx: dict = {}
         self._session = requests.Session()  # Connection pooling for LLM calls
 
     @classmethod
@@ -260,7 +265,7 @@ class HybridRetriever:
         return cls(
             embed_model=r.embed_model,
             ollama_base_url=r.ollama_base_url,
-            extraction_model=cfg.generator.model_small,
+            extraction_model=getattr(r.multihop, "llm_decompose_ollama_model", "qwen3:8b"),
             alpha=r.alpha,
             alpha_bridge=r.alpha_bridge,
             alpha_comparison=r.alpha_comparison,
@@ -271,8 +276,9 @@ class HybridRetriever:
             prompts=getattr(cfg, "prompts", None),
             max_bridge_entities=r.multihop.max_bridge_entities,
             extraction_temperature=getattr(r.multihop, "extraction_temperature", 0.0),
-            extraction_timeout=getattr(r.multihop, "extraction_timeout", 120),
-            confidence_threshold=getattr(r.multihop, "llm_decompose_confidence_threshold", 0.3),
+            extraction_timeout=getattr(r.multihop, "extraction_timeout", 1800),
+            confidence_threshold=getattr(r.multihop, "llm_decompose_confidence_threshold", 1.0),
+            fuzzy_title_threshold=getattr(r.multihop, "fuzzy_title_threshold", 70),
         )
 
     def _get_alpha(self, question_type: Optional[str] = None) -> float:
@@ -308,6 +314,8 @@ class HybridRetriever:
 
         log.step("Building FAISS dense index...")
         self.dense.index(self._texts, show_progress=show_progress)
+
+        self._build_title_index()
 
         log.success(f"{len(self._texts)} passages indexed.")
 
@@ -383,6 +391,8 @@ class HybridRetriever:
         self.alpha_bridge = config.get("alpha_bridge", self.alpha_bridge)
         self.alpha_comparison = config.get("alpha_comparison", self.alpha_comparison)
         self.rrf_k = config.get("rrf_k", self.rrf_k)
+
+        self._build_title_index()
 
         log.success(f"Loaded index from {save_dir}/ ({len(self._passages)} passages)")
 
@@ -460,6 +470,46 @@ class HybridRetriever:
                 confidence=conf if rank == 0 else 0.0,  # confidence only on top result
                 hop=0,
             ))
+        return results
+
+    def _build_title_index(self):
+        """Build a mapping from passage titles to passage indices for fuzzy matching."""
+        self._title_to_idx = {}
+        for i, p in enumerate(self._passages):
+            title = p.title.strip()
+            if title:
+                self._title_to_idx.setdefault(title, []).append(i)
+        self._title_list = list(self._title_to_idx.keys())
+        log.info(f"Built title index: {len(self._title_list)} unique titles")
+
+    def _retrieve_by_title_fuzzy(self, entities: List[str]) -> List[RetrievalResult]:
+        """Retrieve passages whose titles fuzzy-match the given entity strings."""
+        if not self._title_list or not entities:
+            return []
+        results = []
+        seen_titles = set()
+        for entity in entities:
+            matches = fz_process.extract(
+                entity, self._title_list,
+                scorer=fuzz.token_set_ratio,
+                limit=3,
+                score_cutoff=self._fuzzy_title_threshold,
+            )
+            for matched_title, score, _ in matches:
+                if matched_title in seen_titles:
+                    continue
+                seen_titles.add(matched_title)
+                for idx in self._title_to_idx[matched_title]:
+                    results.append(RetrievalResult(
+                        passage=self._passages[idx],
+                        score=score / 100.0,
+                        rank=0,
+                        bm25_score=0.0,
+                        dense_score=0.0,
+                        confidence=0.0,
+                        hop=1,
+                    ))
+        log.info(f"Fuzzy title matching: {len(entities)} entities → {len(results)} passages")
         return results
 
     def _extract_bridge_entities(self, passage: Passage, question: str) -> List[str]:
@@ -541,19 +591,38 @@ class HybridRetriever:
             )
         
         try:
-            url = f"{self.ollama_base_url}/api/generate"
-            payload = {
+            # Try /api/chat first (required for chat-only models like gemma4),
+            # fall back to /api/generate for older models.
+            chat_url = f"{self.ollama_base_url}/api/chat"
+            gen_url = f"{self.ollama_base_url}/api/generate"
+            chat_payload = {
+                "model": self.extraction_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                "stream": False,
+                "options": {"temperature": self.extraction_temperature, "num_ctx": 4096},
+                "keep_alive": -1,
+            }
+            gen_payload = {
                 "model": self.extraction_model,
                 "prompt": prompt,
                 "system": system_prompt,
                 "stream": False,
                 "temperature": self.extraction_temperature,
                 "options": {"num_ctx": 4096},
-                "keep_alive": -1 # Force Ollama to keep it in VRAM so it's ready for the next question
+                "keep_alive": -1,
             }
-            resp = self._session.post(url, json=payload, timeout=self.extraction_timeout)
-            resp.raise_for_status()
-            text = resp.json().get("response", "").strip()
+            resp = self._session.post(chat_url, json=chat_payload, timeout=self.extraction_timeout)
+            if resp.status_code == 404:
+                # Model doesn't support /api/chat, fall back to /api/generate
+                resp = self._session.post(gen_url, json=gen_payload, timeout=self.extraction_timeout)
+                resp.raise_for_status()
+                text = resp.json().get("response", "").strip()
+            else:
+                resp.raise_for_status()
+                text = resp.json().get("message", {}).get("content", "").strip()
             
             entities = []
             try:
@@ -591,89 +660,76 @@ class HybridRetriever:
         return list(dict.fromkeys(fallback))
 
     def retrieve_multihop(self, query: str, hops: int = 2, top_k: int = 10,
-                          top_k_per_hop: int = 5,
+                          top_k_per_hop: int = 20,
                           question_type: Optional[str] = None) -> List[RetrievalResult]:
         """
-        Multi-hop iterative retrieval for bridge questions
+        Multi-hop iterative retrieval with fuzzy title matching.
 
-        How it works:
-          Hop 1: retrieve using the original question
-          Hop 2: extract named entities from hop 1 passages (not just titles!)
-                 reformulate query = question + bridge entities, retrieve again
-          Finally: merge, deduplicate, re-rank results from all hops
+        Hop 1: hybrid retrieve using the original question.
+        Hop 2: extract entities from hop-1 passages, then:
+               (a) fuzzy-match entity strings against passage titles
+               (b) hybrid retrieve with reformulated query (question + entities)
+               Merge fuzzy + hybrid results for hop-2.
+        Finally: deduplicate and re-rank all results.
 
-        Adaptive behavior:
-          - Comparison questions skip hop-2 entirely (both entities are explicit)
-          - Bridge questions gate hop-2 on hop-1 confidence to avoid noise
-
-        query: the original question
-        hops: number of retrieval iterations (default 2 for bridge questions)
-        top_k: total results to return after merging
-        top_k_per_hop: how many passages to retrieve at each hop
-        question_type: "bridge" or "comparison"
-
-        Returns: deduplicated, re-ranked RetrievalResult list
+        Both bridge AND comparison questions run hop-2 (comparison entities
+        benefit from fuzzy title matching too).
         """
-        # Comparison questions: both entities are explicit in the query.
-        # Hop-2 adds noise from LLM entity extraction without retrieval benefit.
-        if question_type == "comparison":
-            log.info(f"Comparison question — single-hop retrieval (skipping hop-2)")
-            return self.retrieve(query, top_k=top_k, question_type=question_type)
-
         all_results: List[RetrievalResult] = []
         seen_keys: set = set()
-        current_query = query
 
-        # Confidence threshold for gating hop-2 (from config)
-        confidence_threshold = getattr(self, '_confidence_threshold', 0.3)
+        # ── Hop 1 ──────────────────────────────────────────────────────
+        hop1_results = self.retrieve(query, top_k=top_k_per_hop,
+                                     question_type=question_type)
+        hop1_scores = [r.score for r in hop1_results]
+        hop1_confidence = _compute_confidence(hop1_scores)
 
-        for hop in range(hops):
-            hop_results = self.retrieve(current_query, top_k=top_k_per_hop,
-                                        question_type=question_type)
+        top_passages_for_extraction = []
+        for r in hop1_results:
+            key = (r.passage.title, r.passage.text)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                r.hop = 0
+                all_results.append(r)
+            top_passages_for_extraction.append(r.passage)
 
-            # Compute confidence for this hop (how dominant is the top result?)
-            hop_scores = [r.score for r in hop_results]
-            hop_confidence = _compute_confidence(hop_scores)
+        # ── Hop 2 (always runs — confidence_threshold defaults to 1.0) ─
+        confidence_threshold = getattr(self, '_confidence_threshold', 1.0)
+        if hop1_confidence > confidence_threshold:
+            log.info(f"Hop-1 confidence {hop1_confidence:.3f} > threshold {confidence_threshold} — skipping hop-2")
+        else:
+            # Extract bridge entities via LLM (falls back to regex)
+            bridge_entities = self._extract_entities_llm(
+                top_passages_for_extraction[:5], query
+            )
+            log.info(f"Hop-1 extracted entities: {bridge_entities}")
 
-            # Collect new (unseen) passages
-            new_in_hop = 0
-            top_passages_for_extraction = []
-            for r in hop_results[:5]:
-                key = (r.passage.title, r.passage.text)
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    r.hop = hop
-                    r.confidence = hop_confidence if new_in_hop == 0 else 0.0  # top result per hop gets confidence
-                    new_in_hop += 1
-                    all_results.append(r)
-                top_passages_for_extraction.append(r.passage)
+            if bridge_entities:
+                # (a) Fuzzy title matching on extracted entities
+                fuzzy_results = self._retrieve_by_title_fuzzy(bridge_entities)
+                for r in fuzzy_results:
+                    key = (r.passage.title, r.passage.text)
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        all_results.append(r)
 
-            # Adaptive: skip hop-2 if hop-1 is already confident (avoids noise)
-            if hop == 0 and question_type != "bridge" and hop_confidence > confidence_threshold:
-                log.info(f"Hop-1 confidence {hop_confidence:.3f} > threshold {confidence_threshold} — skipping hop-2")
-                break
-
-            # Extract bridge entities using LLM
-            bridge_entities = []
-            if hop < hops - 1 and top_passages_for_extraction:
-                bridge_entities = self._extract_entities_llm(top_passages_for_extraction, query)
-                log.info(f"Hop {hop} extracted entities: {bridge_entities}")
-
-            # Reformulate query for next hop using extracted entities
-            if hop < hops - 1 and bridge_entities:
-                # Prioritize title entities over body entities for hop-2 query
-                hop_passage_titles = {r.passage.title for r in hop_results}
-                body_entities = [e for e in bridge_entities if e not in hop_passage_titles]
-                title_entities = [e for e in bridge_entities if e in hop_passage_titles]
-                unique_entities = list(dict.fromkeys(title_entities + body_entities))[:self.max_bridge_entities]
+                # (b) Hybrid retrieve with reformulated query
+                unique_entities = bridge_entities[:self.max_bridge_entities]
                 entity_str = " ".join(unique_entities)
-                current_query = f"{query} {entity_str}"
-                log.info(f"Hop {hop+1} formulated query: {current_query}")
+                hop2_query = f"{query} {entity_str}"
+                log.info(f"Hop-2 query: {hop2_query}")
 
-        # Re-rank all collected results by score (descending)
+                hop2_results = self.retrieve(hop2_query, top_k=top_k_per_hop,
+                                             question_type=question_type)
+                for r in hop2_results:
+                    key = (r.passage.title, r.passage.text)
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        r.hop = 1
+                        all_results.append(r)
+
+        # ── Merge & re-rank ────────────────────────────────────────────
         all_results.sort(key=lambda r: r.score, reverse=True)
-
-        # Re-assign ranks (keep per-hop confidence as-is)
         for i, r in enumerate(all_results):
             r.rank = i
 

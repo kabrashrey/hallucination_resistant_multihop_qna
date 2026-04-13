@@ -46,6 +46,7 @@ class MultihopConfig:
     llm_decompose_ollama_model: str = "qwen3:8b"
     extraction_temperature: float = 0.0
     extraction_timeout: int = 120
+    fuzzy_title_threshold: int = 70
 
 
 @dataclass
