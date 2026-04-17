@@ -285,6 +285,125 @@ def main():
     print(f"  EM correct:    {entity_em} ({entity_em/max(entity_total,1)*100:.1f}%)")
     print(f"  Partial (F1>0.5): {entity_partial} ({entity_partial/max(entity_total,1)*100:.1f}%)")
     print(f"  Wrong:         {entity_wrong} ({entity_wrong/max(entity_total,1)*100:.1f}%)")
+    
+    # ========== 6. Verification analysis ==========
+    # Only if predictions contain verification results (from the new pipeline)
+    has_verification = any(
+        pred.get('verification') is not None 
+        for pred in preds.values()
+    )
+    
+    if has_verification:
+        print(f"\n{'='*80}")
+        print(f"VERIFICATION ANALYSIS")
+        print(f"{'='*80}")
+        
+        v_supported = 0
+        v_unsupported = 0
+        v_missing = 0
+        v_scores = []
+        
+        # Track EM by verification status
+        supported_em = 0
+        supported_total = 0
+        unsupported_em = 0
+        unsupported_total = 0
+        
+        # Track verification by question type
+        v_type_stats = defaultdict(lambda: {'supported': 0, 'unsupported': 0, 'scores': []})
+        
+        for qid, pred in preds.items():
+            if qid not in gold:
+                continue
+            g = gold[qid]
+            vr = pred.get('verification')
+            pred_ans = pred.get('answer', '')
+            em = 1.0 if normalize_answer(pred_ans) == normalize_answer(g['answer']) else 0.0
+            qtype = g['type']
+            
+            if vr is None:
+                v_missing += 1
+                continue
+            
+            score = vr.get('support_score', 0.0)
+            is_supported = vr.get('is_supported', False)
+            v_scores.append(score)
+            
+            if is_supported:
+                v_supported += 1
+                supported_total += 1
+                supported_em += em
+                v_type_stats[qtype]['supported'] += 1
+            else:
+                v_unsupported += 1
+                unsupported_total += 1
+                unsupported_em += em
+                v_type_stats[qtype]['unsupported'] += 1
+            
+            v_type_stats[qtype]['scores'].append(score)
+        
+        v_total = v_supported + v_unsupported
+        if v_total > 0:
+            avg_score = sum(v_scores) / len(v_scores)
+            print(f"\n--- OVERALL VERIFICATION ---")
+            print(f"  Verified predictions:  {v_total}")
+            print(f"  Supported:   {v_supported}/{v_total} ({v_supported/v_total*100:.1f}%)")
+            print(f"  Unsupported: {v_unsupported}/{v_total} ({v_unsupported/v_total*100:.1f}%)")
+            if v_missing:
+                print(f"  Missing:     {v_missing}")
+            print(f"  Avg support score:   {avg_score:.4f}")
+            print(f"  Min support score:   {min(v_scores):.4f}")
+            print(f"  Max support score:   {max(v_scores):.4f}")
+            
+            print(f"\n--- VERIFICATION vs CORRECTNESS ---")
+            if supported_total > 0:
+                print(f"  Supported answers:   EM={supported_em/supported_total*100:.1f}% (n={supported_total})")
+            if unsupported_total > 0:
+                print(f"  Unsupported answers: EM={unsupported_em/unsupported_total*100:.1f}% (n={unsupported_total})")
+            
+            # This is the key diagnostic: if supported EM >> unsupported EM,
+            # the verifier is discriminating well and retries help
+            if supported_total > 0 and unsupported_total > 0:
+                gap = (supported_em/supported_total - unsupported_em/unsupported_total) * 100
+                if gap > 5:
+                    print(f"  → Verifier discriminates well (+{gap:.1f}pp EM gap)")
+                elif gap > 0:
+                    print(f"  → Verifier has weak discrimination (+{gap:.1f}pp EM gap)")
+                else:
+                    print(f"  → Verifier not discriminating ({gap:.1f}pp EM gap)")
+            
+            print(f"\n--- VERIFICATION BY QUESTION TYPE ---")
+            for qtype, stats in sorted(v_type_stats.items()):
+                n = stats['supported'] + stats['unsupported']
+                avg_s = sum(stats['scores']) / len(stats['scores']) if stats['scores'] else 0
+                sup_rate = stats['supported'] / n * 100 if n else 0
+                print(f"  {qtype:>12s}: n={n:>3d}  supported={sup_rate:>5.1f}%  avg_score={avg_s:.3f}")
+            
+            # Show worst unsupported but correct answers (verifier false negatives)
+            false_negatives = []
+            for qid, pred in preds.items():
+                if qid not in gold:
+                    continue
+                g = gold[qid]
+                vr = pred.get('verification')
+                if vr is None:
+                    continue
+                pred_ans = pred.get('answer', '')
+                em = normalize_answer(pred_ans) == normalize_answer(g['answer'])
+                if em and not vr.get('is_supported', True):
+                    false_negatives.append({
+                        'qid': qid,
+                        'answer': pred_ans[:60],
+                        'score': vr.get('support_score', 0),
+                        'type': g['type'],
+                    })
+            
+            if false_negatives:
+                false_negatives.sort(key=lambda x: x['score'])
+                print(f"\n--- VERIFIER FALSE NEGATIVES (correct but marked unsupported) ---")
+                print(f"  Total: {len(false_negatives)}")
+                for entry in false_negatives[:5]:
+                    print(f"  [{entry['type']}] score={entry['score']:.3f} answer='{entry['answer']}'")
 
 if __name__ == '__main__':
     main()

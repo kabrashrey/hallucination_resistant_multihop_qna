@@ -10,6 +10,7 @@ from pipeline.indexer import HybridRetriever
 from pipeline.reranker import Reranker
 from pipeline.prompt_builder import PromptBuilder
 from pipeline.generator import Generator
+from pipeline.verifier import Verifier
 
 log = get_logger("test_pipeline")
 
@@ -37,6 +38,10 @@ def test_single_example():
     reranker = Reranker.from_config(cfg)
     pb = PromptBuilder.from_config(cfg)
     gen = Generator.from_config(cfg)
+    
+    verifier = None
+    if getattr(cfg.verifier, "enabled", False):
+        verifier = Verifier.from_config(cfg)
     
     ex = examples[0]
     log.info(f"\n{'='*80}")
@@ -79,6 +84,17 @@ def test_single_example():
     log.info(f"Supporting facts: {gen_output.supporting_facts}")
     log.info(f"Model: {gen_output.model_used}")
     log.info(f"Generation time: {gen_output.generation_time:.2f}s")
+    
+    # 5. Verify
+    if verifier is not None:
+        vr = verifier.verify(
+            answer=gen_output.answer,
+            evidence=reranked,
+            supporting_facts=gen_output.supporting_facts,
+        )
+        log.info(f"Verification: supported={vr.is_supported}, score={vr.support_score:.4f}")
+        if vr.unsupported_claims:
+            log.info(f"Unsupported claims: {vr.unsupported_claims}")
     log.info(f"{'='*80}\n")
 
 if __name__ == "__main__":
