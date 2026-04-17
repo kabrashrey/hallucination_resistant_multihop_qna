@@ -460,6 +460,12 @@ def main():
         default=Path("results/metrics/metrics.json"),
         help="Output path for evaluation metrics",
     )
+    parser.add_argument(
+        "--ids",
+        type=Path,
+        default=None,
+        help="Path to JSON file containing list of example IDs to re-run (skips all others)",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -472,17 +478,31 @@ def main():
     if args.limit:
         cfg.eval.limit = args.limit
 
+    # Load ID filter if provided
+    id_filter = None
+    if args.ids:
+        with open(args.ids) as f:
+            id_filter = set(json.load(f))
+        log.info(f"ID filter loaded: {len(id_filter)} examples to re-run")
+
     log.info(f"{'='*80}")
     log.info(f"Evaluating on: {args.split}")
     if args.limit:
         log.info(f"Limit: {args.limit} examples")
+    if id_filter:
+        log.info(f"Re-running {len(id_filter)} failed IDs only")
     log.info(f"Output: {args.output}")
     log.info(f"{'='*80}")
 
     examples, retriever, reranker, pb, gen, verifier, decider, cfg = build_pipeline(cfg)
 
+    # Filter examples to only the requested IDs
+    if id_filter:
+        examples = [ex for ex in examples if ex.id in id_filter]
+        log.info(f"Filtered to {len(examples)} examples matching ID list")
+
     predictions = run_pipeline(examples, retriever, reranker, pb, gen, verifier, decider, cfg, limit=args.limit,
-                               output_path=args.output, resume=True)
+                               output_path=args.output, resume=False)
 
     save_predictions(predictions, args.output)
 
