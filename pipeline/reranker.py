@@ -32,11 +32,11 @@ class RerankResult:
 class Reranker:
     def __init__(
         self,
-        model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
-        sentence_model_name: str = "nomic-embed-text",
+        model_name: str = "BAAI/bge-reranker-v2-m3",
+        sentence_model_name: str = "qwen3-embedding:8b",
         ollama_base_url: str = "http://localhost:11434",
         device: str = "auto",
-        sentence_score_threshold: float = 0.4,
+        sentence_score_threshold: float = 0.25,
         max_sentences_per_passage: int = 5,
         batch_size: int = 32,
         sentence_passage_limit: int = 3,
@@ -138,6 +138,12 @@ class Reranker:
         self, query: str, 
         results: List[RerankResult]
         ) -> None:
+        """Select supporting sentences using cross-encoder scoring for high precision.
+        
+        Uses the same cross-encoder loaded for passage re-ranking to score (query, sentence) pairs. 
+        This is much more precise than bi-encoder cosine similarity because it models token-level 
+        interactions between query and sentence. The total number of pairs is small (~15-25), so latency is negligible.
+        """
 
         active_results = results[: self.sentence_passage_limit]
         passage_sentence_ranges: List[Tuple[int, int]] = []
@@ -164,11 +170,16 @@ class Reranker:
                 r.sentence_scores = []
             return
 
-        query_vec: np.ndarray = self._sentence_encoder.encode_query(query)  
-        sent_vecs: np.ndarray = self._sentence_encoder.encode(all_sentences)
+        # Cross-encoder scoring: (query, sentence) pairs scored jointly
+        pairs = [(query, sent) for sent in all_sentences]
+        log.step(f"Cross-encoder scoring {len(pairs)} sentences...")
+        ce_scores: np.ndarray = self._cross_encoder.predict(
+            pairs, batch_size=self.batch_size, show_progress_bar=False
+        )
 
-        # Cosine similarity = dot product on unit vectors
-        sim_scores: np.ndarray = sent_vecs @ query_vec  # shape: (n_sentences,)
+        # Normalize cross-encoder scores to [0, 1] range using sigmoid
+        # Raw CE scores can be arbitrary floats; sigmoid maps them to probabilities
+        ce_scores = 1.0 / (1.0 + np.exp(-np.array(ce_scores, dtype=np.float64)))
 
         query_words = self._normalize_tokens(query)
         for r_idx, (r, (start, end)) in enumerate(zip(results, passage_sentence_ranges)):
@@ -176,7 +187,7 @@ class Reranker:
                 continue
 
             sents = all_sentences[start:end]
-            scores = sim_scores[start:end].tolist()
+            scores = ce_scores[start:end].tolist()
             orig_indices = sentence_to_orig_idx_mapping[r_idx]
 
             # Title-match boost: if passage title words overlap with query, boost all sentence scores

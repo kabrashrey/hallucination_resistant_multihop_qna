@@ -42,6 +42,7 @@ class PromptBuilder:
         reranked_results: List[RerankResult],
         include_metadata: bool = True,
         use_citation_selection: bool = True,
+        question_type: str = "",
     ) -> PromptBuilderOutput:
         if not reranked_results:
             raise ValueError("No reranked results provided")
@@ -62,9 +63,12 @@ class PromptBuilder:
         target_model = "complex" if complexity_score > threshold else "simple"
 
         if use_citation_selection:
-            instructions = self._build_instructions(query, facts_list_str=facts_list_str, fact_mapping=fact_mapping)
+            instructions = self._build_instructions(
+                query, facts_list_str=facts_list_str, fact_mapping=fact_mapping,
+                question_type=question_type,
+            )
         else:
-            instructions = self._build_instructions(query)
+            instructions = self._build_instructions(query, question_type=question_type)
 
         if self.cfg.evidence_first:
             prompt = f"{evidence_block}\n\n{instructions}"
@@ -102,7 +106,9 @@ class PromptBuilder:
             passage = result.passage
             lines.append(f"Passage {passage_idx}: [{passage.title}]")
 
-            for sent_str, sent_idx in zip(result.supporting_sentences[:3], result.supporting_sentence_indices[:3]):
+            # Rank-aware: top-2 passages get 3 sentences, rest get 2
+            max_sents = 3 if passage_idx < 2 else 2
+            for sent_str, sent_idx in zip(result.supporting_sentences[:max_sents], result.supporting_sentence_indices[:max_sents]):
                 display_sent = sent_str[:180] + "..." if len(sent_str) > 180 else sent_str
                 lines.append(f"  [{sent_idx}] {display_sent}")
 
@@ -161,17 +167,57 @@ class PromptBuilder:
         fact_mapping = {}  # fact_number -> (title, sentence_idx)
         fact_number = 0
 
-        for _, result in enumerate(results):
+        for passage_idx, result in enumerate(results):
             passage = result.passage
-            for sent_str, sent_idx in list(zip(result.supporting_sentences, result.supporting_sentence_indices))[:3]:
+            # Rank-aware: top-2 passages get 3 facts, rest get 2
+            max_facts = 3 if passage_idx < 2 else 2
+            for sent_str, sent_idx in list(zip(result.supporting_sentences, result.supporting_sentence_indices))[:max_facts]:
                 display_sent = sent_str[:180] + "..." if len(sent_str) > 180 else sent_str
                 lines.append(f"Fact {fact_number}: [{passage.title}, {sent_idx}] {display_sent}")
                 fact_mapping[fact_number] = (passage.title, sent_idx)
                 fact_number += 1
         return "\n".join(lines), fact_mapping
 
-    def _build_instructions(self, query: str, facts_list_str: str = "", fact_mapping: Dict = None) -> str:
+    def _is_yesno_question(self, query: str, question_type: str = "") -> bool:
+        """Detect yes/no questions via syntax heuristics.
+        
+        IMPORTANT: Do NOT assume all comparison questions are yes/no.
+        In HotpotQA, many comparison questions expect entity answers:
+          - "Which writer was from England?" → entity answer
+          - "Who is older, X or Y?" → entity answer
+          - "Are both X and Y from Z?" → yes/no answer
+        
+        Only route to yes/no when the syntax clearly indicates a boolean question.
+        """
+        q_lower = query.strip().lower()
+        
+        # Entity-seeking questions are NEVER yes/no, even within comparison type
+        entity_starters = (
+            "which ", "who ", "what ", "where ", "when ", "how ",
+            "name ", "in which ",
+        )
+        if q_lower.startswith(entity_starters):
+            return False
+        
+        # Syntax-based detection: questions starting with boolean indicators
+        yesno_starters = (
+            "is ", "are ", "was ", "were ", "did ", "does ", "do ",
+            "has ", "have ", "had ", "can ", "could ", "will ", "would ",
+            "should ", "shall ",
+        )
+        return q_lower.startswith(yesno_starters)
+
+    def _build_instructions(self, query: str, facts_list_str: str = "",
+                            fact_mapping: Dict = None, question_type: str = "") -> str:
+        is_yesno = self._is_yesno_question(query, question_type)
+
         if fact_mapping is not None and facts_list_str:
+            # Yes/No questions get a specialized prompt for boolean reasoning
+            if is_yesno and self.prompts and self.prompts.builder_citation_yesno:
+                log.info("Using yes/no specialized prompt")
+                return self.prompts.builder_citation_yesno.format(
+                    query=query, facts_list_str=facts_list_str
+                )
             # Citation selection approach
             if self.prompts and self.prompts.builder_citation:
                 return self.prompts.builder_citation.format(query=query, facts_list_str=facts_list_str)

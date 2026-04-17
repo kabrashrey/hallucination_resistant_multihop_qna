@@ -24,9 +24,9 @@ class Generator:
     def __init__(
         self,
         ollama_base_url: str = "http://localhost:11434",
-        model_small: str = "mistral:7b",
-        model_large: str = "mistral:7b",
-        request_timeout: int = 120,
+        model_small: str = "gemma3:12b",
+        model_large: str = "qwen3:32b",
+        request_timeout: int = 1800,
         validate_citations: bool = True,
         retry_on_parse_failure: bool = True,
         specialist_mode: bool = False,
@@ -88,6 +88,12 @@ class Generator:
         generation_time = time.time() - start_time
 
         answer, supporting_facts = self._parse_output(response_text, supporting_fact_indices, fact_mapping)
+
+        # Post-processing: numeric answer extraction for "how many" questions
+        if answer:
+            question = self._extract_question_from_prompt(prompt)
+            if question:
+                answer = self._extract_numeric_answer(answer, question, prompt)
 
         # If parsing failed to get both answer+facts, try a repair call
         if self.retry_on_parse_failure and fact_mapping and not supporting_facts and answer:
@@ -241,23 +247,43 @@ class Generator:
 
     # --- Ollama backend ---
     def _call_ollama(self, prompt: str, model: str, temperature: float) -> str:
-        url = f"{self.ollama_base_url}/api/generate"
-        payload = {
+        # Try /api/chat first (required for chat-only models like gemma4),
+        # fall back to /api/generate for older models.
+        chat_url = f"{self.ollama_base_url}/api/chat"
+        gen_url = f"{self.ollama_base_url}/api/generate"
+        chat_payload = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "options": {"temperature": temperature, "num_ctx": 8192},
+            "keep_alive": -1,
+        }
+        gen_payload = {
             "model": model,
             "prompt": prompt,
             "stream": False,
             "temperature": temperature,
-            "options": {"num_ctx": 4096},
-            "keep_alive": -1
+            "options": {"num_ctx": 8192},
+            "keep_alive": -1,
         }
 
         try:
-            log.step(f"Calling Ollama ({model}) at {url}...")
+            log.step(f"Calling Ollama ({model})...")
             response = self.session.post(
-                url,
-                json=payload,
+                chat_url,
+                json=chat_payload,
                 timeout=self.request_timeout,
             )
+            if response.status_code == 404:
+                # Model doesn't support /api/chat, fall back to /api/generate
+                log.info(f"{model} doesn't support /api/chat, using /api/generate")
+                response = self.session.post(
+                    gen_url,
+                    json=gen_payload,
+                    timeout=self.request_timeout,
+                )
             response.raise_for_status()
         except requests.ConnectionError as e:
             log.error(f"Cannot connect to Ollama at {self.ollama_base_url}")
@@ -276,7 +302,11 @@ class Generator:
 
         try:
             response_data = response.json()
-            response_text = response_data.get("response", "")
+            # /api/chat returns message.content, /api/generate returns response
+            if "message" in response_data:
+                response_text = response_data["message"].get("content", "")
+            else:
+                response_text = response_data.get("response", "")
         except Exception as e:
             log.error(f"Failed to parse Ollama response: {e}")
             raise RuntimeError(f"Failed to parse Ollama JSON response: {e}") from e
@@ -532,6 +562,9 @@ class Generator:
         # Strip whitespace and surrounding quotes
         answer = answer.strip().strip('"').strip("'").strip()
 
+        # Strip parenthetical clarifications that hurt EM
+        answer = re.sub(r'\s*\([^)]*\)\s*$', '', answer).strip()
+
         # Remove common LLM preamble patterns
         preamble_patterns = [
             r'^Based on the (?:provided )?evidence,?\s*',
@@ -539,9 +572,17 @@ class Generator:
             r'^The answer is:?\s*',
             r'^Answer:?\s*',
             r'^From the evidence,?\s*',
+            # Filler patterns: "It is X" -> "X", "There are X" -> "X"
+            r'^(?:It|This)\s+(?:is|was|appears to be|seems to be)\s+',
+            r'^There\s+(?:is|are|was|were)\s+',
         ]
         for pattern in preamble_patterns:
             answer = re.sub(pattern, '', answer, flags=re.IGNORECASE)
+
+        # Strip leading articles for short answers (≤ 5 words)
+        # "the Chief of Protocol" -> "Chief of Protocol" (only if short)
+        if len(answer.split()) <= 5:
+            answer = re.sub(r'^(?:the|a|an)\s+', '', answer, flags=re.IGNORECASE)
 
         # Remove trailing periods from short answers (common LLM habit)
         if len(answer.split()) <= 5 and answer.endswith('.'):
@@ -556,11 +597,40 @@ class Generator:
         if answer_lower in ('yes', 'no', 'noanswer', 'yes.', 'no.'):
             answer = answer_lower.rstrip('.')
 
-        # Strip leading "the " for short entity answers
-        if answer.lower().startswith('the ') and len(answer.split()) <= 4:
-            answer = answer[4:]
-
         return answer.strip()
+
+    def _extract_question_from_prompt(self, prompt: str) -> str:
+        match = re.search(r'QUESTION:\s*(.+?)(?:\n|$)', prompt)
+        if match:
+            return match.group(1).strip()
+        match = re.search(r'Question:\s*(.+?)(?:\n|$)', prompt)
+        if match:
+            return match.group(1).strip()
+        return ""
+
+    def _extract_numeric_answer(self, answer: str, question: str, evidence: str) -> str:
+        q_lower = question.lower()
+        numeric_triggers = ["how many", "how much", "can seat", "capacity", "number of"]
+        if not any(trigger in q_lower for trigger in numeric_triggers):
+            return answer
+        if re.search(r'\d', answer):
+            return answer
+        context_patterns = [
+            r'(\d[\d,]+)\s*(?:seat|capacity|people|member|student|employee)',
+            r'(?:seat|capacity|people|member|student|employee)\w*\s*(?:of\s+)?(\d[\d,]+)',
+            r'(\d[\d,]+)\s*(?:seated)',
+        ]
+        for pattern in context_patterns:
+            matches = re.findall(pattern, evidence, re.IGNORECASE)
+            if matches:
+                return matches[0]
+        numbers = re.findall(r'\b(\d[\d,]+)\b', evidence)
+        if numbers:
+            non_round = [n for n in numbers if not n.endswith('000') and not n.endswith('00')]
+            if non_round:
+                return non_round[0]
+            return numbers[0]
+        return answer
 
     def _validate_citations(
         self, supporting_facts: List[List[str]], supporting_fact_indices: Dict
