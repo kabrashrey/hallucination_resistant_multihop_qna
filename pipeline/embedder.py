@@ -9,9 +9,9 @@ log = get_logger("embedder")
 class OllamaEmbedder:
     def __init__(
         self,
-        model: str = "nomic-embed-text",
+        model: str = "qwen3-embedding:8b",
         base_url: str = "http://localhost:11434",
-        batch_size: int = 64,
+        batch_size: int = 32,
     ):
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -68,7 +68,7 @@ class OllamaEmbedder:
             }
 
         try:
-            resp = requests.post(url, json=payload, timeout=120)
+            resp = requests.post(url, json=payload, timeout=1800)
             resp.raise_for_status()
         except requests.ConnectionError as e:
             raise RuntimeError(f"Ollama not reachable at {url}") from e
