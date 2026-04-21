@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple, Union
 from dataclasses import dataclass
 from rank_bm25 import BM25Okapi
 from rapidfuzz import fuzz, process as fz_process
-from pipeline.embedder import OllamaEmbedder
+from pipeline.embedder import OllamaEmbedder, build_embedder
 from pipeline.data_loader import Passage
 from scripts.config import load_config, get_best_device
 from scripts.logger import get_logger
@@ -147,17 +147,22 @@ class DenseRetriever:
         batch_size: int = 32,
         # legacy param kept so from_config() call sites don't break
         device: str = "auto",
+        # Optional pre-built embedder (e.g. VLLMEmbedder) — overrides model_name/ollama_base_url
+        embedder=None,
     ):
         if device == "auto":
             device = get_best_device()
         self.device = device
         self.model_name = model_name
         self.batch_size = batch_size
-        self.encoder = OllamaEmbedder(
-            model=model_name,
-            base_url=ollama_base_url,
-            batch_size=batch_size,
-        )
+        if embedder is not None:
+            self.encoder = embedder
+        else:
+            self.encoder = OllamaEmbedder(
+                model=model_name,
+                base_url=ollama_base_url,
+                batch_size=batch_size,
+            )
         self._index: Optional[faiss.IndexFlatIP] = None
         self._dim: int = self.encoder.dim
 
@@ -226,6 +231,8 @@ class HybridRetriever:
         extraction_timeout: int = 1800,
         confidence_threshold: float = 1.0,
         fuzzy_title_threshold: int = 70,
+        # Optional pre-built embedder (e.g. VLLMEmbedder) — if provided, overrides embed_model/ollama_base_url
+        embedder=None,
     ):
         self.extraction_model = extraction_model
         self.ollama_base_url = ollama_base_url
@@ -246,6 +253,7 @@ class HybridRetriever:
             model_name=embed_model,
             ollama_base_url=ollama_base_url,
             batch_size=batch_size,
+            embedder=embedder,
         )
         self._passages: List[Passage] = []
         self._texts: List[str] = []
@@ -262,6 +270,10 @@ class HybridRetriever:
         if cfg is None or isinstance(cfg, (str, Path)):
             cfg = load_config(cfg)
         r = cfg.retriever
+
+        # Build embedder — VLLMEmbedder if use_vllm=true, else OllamaEmbedder
+        embedder = build_embedder(cfg)
+
         return cls(
             embed_model=r.embed_model,
             ollama_base_url=r.ollama_base_url,
@@ -279,6 +291,7 @@ class HybridRetriever:
             extraction_timeout=getattr(r.multihop, "extraction_timeout", 1800),
             confidence_threshold=getattr(r.multihop, "llm_decompose_confidence_threshold", 1.0),
             fuzzy_title_threshold=getattr(r.multihop, "fuzzy_title_threshold", 70),
+            embedder=embedder,
         )
 
     def _get_alpha(self, question_type: Optional[str] = None) -> float:

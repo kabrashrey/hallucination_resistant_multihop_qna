@@ -11,6 +11,11 @@ from scripts.logger import get_logger
 
 log = get_logger("generator")
 
+# vLLM backend — imported lazily so Ollama-only setups don't need vllm installed
+def _get_vllm_backend():
+    from pipeline.vllm_backend import VLLMGeneratorBackend
+    return VLLMGeneratorBackend
+
 
 @dataclass
 class GeneratorOutput:
@@ -31,6 +36,12 @@ class Generator:
         retry_on_parse_failure: bool = True,
         specialist_mode: bool = False,
         prompts=None,
+        # ── vLLM options ──────────────────────────────────────────────────
+        use_vllm: bool = False,
+        vllm_base_url: str = "http://localhost:8000",
+        vllm_model_small: str = "Qwen/Qwen2.5-7B-Instruct",
+        vllm_model_large: str = "Qwen/Qwen2.5-7B-Instruct",
+        vllm_max_tokens: int = 1024,
     ):
         self.ollama_base_url = ollama_base_url
         self.model_small = model_small
@@ -40,12 +51,51 @@ class Generator:
         self.retry_on_parse_failure = retry_on_parse_failure
         self.specialist_mode = specialist_mode
         self.prompts = prompts
-        self.session = requests.Session()  # Connection pooling
+        self.session = requests.Session()  # Connection pooling (Ollama path)
 
-        if self.specialist_mode:
-            log.success(f"Generator ready. Specialist mode: {self.model_large} (SP) + {self.model_small} (answer)")
+        # ── vLLM setup ────────────────────────────────────────────────────
+        self.use_vllm = use_vllm
+        self._vllm_small: Optional[object] = None
+        self._vllm_large: Optional[object] = None
+
+        if use_vllm:
+            VLLMGeneratorBackend = _get_vllm_backend()
+            # If both models are the same URL/name, share one backend instance
+            self._vllm_small = VLLMGeneratorBackend(
+                base_url=vllm_base_url,
+                model=vllm_model_small,
+                request_timeout=request_timeout,
+                max_tokens=vllm_max_tokens,
+            )
+            if vllm_model_large != vllm_model_small:
+                self._vllm_large = VLLMGeneratorBackend(
+                    base_url=vllm_base_url,
+                    model=vllm_model_large,
+                    request_timeout=request_timeout,
+                    max_tokens=vllm_max_tokens,
+                )
+            else:
+                self._vllm_large = self._vllm_small
+
+            # Override the logical model name attributes so logging is consistent
+            self.model_small = vllm_model_small
+            self.model_large = vllm_model_large
+
+            if self.specialist_mode:
+                log.success(
+                    f"Generator ready. Specialist mode (vLLM): "
+                    f"{vllm_model_large} (SP) + {vllm_model_small} (answer)"
+                )
+            else:
+                log.success(
+                    f"Generator ready. Backend: vLLM at {vllm_base_url} "
+                    f"(small={vllm_model_small}, large={vllm_model_large})"
+                )
         else:
-            log.success(f"Generator ready. Backend: Ollama at {ollama_base_url}")
+            if self.specialist_mode:
+                log.success(f"Generator ready. Specialist mode: {self.model_large} (SP) + {self.model_small} (answer)")
+            else:
+                log.success(f"Generator ready. Backend: Ollama at {ollama_base_url}")
 
     @classmethod
     def from_config(cls, cfg=None) -> "Generator":
@@ -60,7 +110,13 @@ class Generator:
             validate_citations=g.validate_citations,
             retry_on_parse_failure=getattr(g, 'retry_on_parse_failure', True),
             specialist_mode=getattr(g, 'specialist_mode', False),
-            prompts=getattr(cfg, "prompts", None)
+            prompts=getattr(cfg, "prompts", None),
+            # vLLM
+            use_vllm=getattr(g, 'use_vllm', False),
+            vllm_base_url=getattr(g, 'vllm_base_url', 'http://localhost:8000'),
+            vllm_model_small=getattr(g, 'vllm_model_small', 'Qwen/Qwen2.5-7B-Instruct'),
+            vllm_model_large=getattr(g, 'vllm_model_large', 'Qwen/Qwen2.5-7B-Instruct'),
+            vllm_max_tokens=getattr(g, 'vllm_max_tokens', 1024),
         )
 
     def generate(
@@ -84,7 +140,7 @@ class Generator:
             model_name = self.model_small
 
         start_time = time.time()
-        response_text = self._call_ollama(prompt, model_name, temperature)
+        response_text = self._call_llm(prompt, model_name, temperature)
         generation_time = time.time() - start_time
 
         answer, supporting_facts = self._parse_output(response_text, supporting_fact_indices, fact_mapping)
@@ -130,7 +186,7 @@ class Generator:
 
         # --- Call 1: Large model selects supporting facts ---
         log.info(f"Specialist mode: {self.model_large} selecting facts...")
-        sp_response = self._call_ollama(prompt, self.model_large, temperature=0.1)
+        sp_response = self._call_llm(prompt, self.model_large, temperature=0.1)
         _, supporting_facts = self._parse_output(sp_response, supporting_fact_indices, fact_mapping)
 
         if not supporting_facts:
@@ -203,7 +259,7 @@ class Generator:
         # --- Call 2: Ollama generates answer ---
         ollama_model = self.model_small
         log.info(f"Specialist mode: {ollama_model} generating answer...")
-        ans_response = self._call_ollama(answer_prompt, ollama_model, temperature=0.1)
+        ans_response = self._call_llm(answer_prompt, ollama_model, temperature=0.1)
 
         # Parse answer from response
         answer = ""
@@ -241,9 +297,21 @@ class Generator:
         supporting_fact_indices: Optional[Dict] = None,
         fact_mapping: Optional[Dict] = None,
     ) -> tuple:
-        response_text = self._call_ollama(prompt, model_name, temperature)
+        response_text = self._call_llm(prompt, model_name, temperature)
         answer, supporting_facts = self._parse_output(response_text, supporting_fact_indices, fact_mapping)
         return answer, supporting_facts
+
+    # --- Unified LLM call (routes to vLLM or Ollama) ---
+    def _call_llm(self, prompt: str, model: str, temperature: float) -> str:
+        """Route the generation call to vLLM or Ollama depending on config."""
+        if self.use_vllm:
+            return self._call_vllm(prompt, model, temperature)
+        return self._call_ollama(prompt, model, temperature)
+
+    def _call_vllm(self, prompt: str, model: str, temperature: float) -> str:
+        """Call the vLLM backend. Selects small/large backend by model name."""
+        backend = self._vllm_large if model == self.model_large else self._vllm_small
+        return backend.generate(prompt, temperature=temperature)
 
     # --- Ollama backend ---
     def _call_ollama(self, prompt: str, model: str, temperature: float) -> str:
@@ -539,7 +607,7 @@ class Generator:
             )
 
             log.info("JSON repair: making second LLM call to reformat response...")
-            repair_response = self._call_ollama(repair_prompt, model_name, temperature=0.0)
+            repair_response = self._call_llm(repair_prompt, model_name, temperature=0.0)
 
             # Pass _allow_repair=False to prevent infinite recursion
             answer, supporting_facts = self._parse_output(

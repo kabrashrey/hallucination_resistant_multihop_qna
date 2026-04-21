@@ -63,6 +63,10 @@ class RetrieverConfig:
     top_k: int = 10
     multihop: MultihopConfig = field(default_factory=MultihopConfig)
     index_cache_dir: str = "index_cache"
+    # ── vLLM embeddings ───────────────────────────────────────────────────
+    use_vllm: bool = False
+    vllm_embed_model: str = "Qwen/Qwen3-Embedding-8B"
+    vllm_embed_base_url: str = "http://localhost:8001"
 
 
 @dataclass
@@ -108,6 +112,12 @@ class GeneratorConfig:
     validate_citations: bool = True
     retry_on_parse_failure: bool = True
     specialist_mode: bool = False
+    # ── vLLM generation ───────────────────────────────────────────────────
+    use_vllm: bool = False
+    vllm_base_url: str = "http://localhost:8000"
+    vllm_model_small: str = "Qwen/Qwen2.5-7B-Instruct"
+    vllm_model_large: str = "Qwen/Qwen2.5-7B-Instruct"
+    vllm_max_tokens: int = 1024
 
 
 @dataclass

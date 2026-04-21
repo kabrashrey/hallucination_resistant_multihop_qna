@@ -6,6 +6,33 @@ from scripts.logger import get_logger
 log = get_logger("embedder")
 
 
+def build_embedder(cfg=None):
+    """
+    Factory: returns a VLLMEmbedder if cfg.retriever.use_vllm is True,
+    otherwise returns an OllamaEmbedder.
+
+    Can be called with a Config object or without args (uses defaults).
+    """
+    if cfg is not None:
+        r = cfg.retriever
+        if getattr(r, "use_vllm", False):
+            from pipeline.vllm_backend import VLLMEmbedder
+            return VLLMEmbedder(
+                model=getattr(r, "vllm_embed_model", "Qwen/Qwen3-Embedding-8B"),
+                base_url=getattr(r, "vllm_embed_base_url", "http://localhost:8001"),
+                batch_size=r.batch_size,
+            )
+    # Default: Ollama
+    if cfg is not None:
+        r = cfg.retriever
+        return OllamaEmbedder(
+            model=r.embed_model,
+            base_url=r.ollama_base_url,
+            batch_size=r.batch_size,
+        )
+    return OllamaEmbedder()
+
+
 class OllamaEmbedder:
     def __init__(
         self,

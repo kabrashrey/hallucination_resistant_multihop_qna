@@ -9,7 +9,7 @@ import numpy as np
 from sentence_transformers import CrossEncoder
 
 from pipeline.data_loader import Passage
-from pipeline.embedder import OllamaEmbedder
+from pipeline.embedder import OllamaEmbedder, build_embedder
 from pipeline.indexer import RetrievalResult
 from scripts.config import get_best_device
 from scripts.logger import get_logger
@@ -41,6 +41,8 @@ class Reranker:
         batch_size: int = 32,
         sentence_passage_limit: int = 3,
         title_overlap_boost: float = 0.05,
+        # Optional pre-built embedder (e.g. VLLMEmbedder) for sentence scoring
+        sentence_embedder=None,
     ):
         if device == "auto":
             device = get_best_device()
@@ -55,12 +57,16 @@ class Reranker:
         log.info(f"Loading cross-encoder: {model_name}")
         self._cross_encoder = CrossEncoder(model_name, device=device)
 
-        log.info(f"Loading sentence encoder via Ollama: {sentence_model_name}")
-        self._sentence_encoder = OllamaEmbedder(
-            model=sentence_model_name,
-            base_url=ollama_base_url,
-            batch_size=batch_size,
-        )
+        if sentence_embedder is not None:
+            log.info(f"Using pre-built sentence embedder: {type(sentence_embedder).__name__}")
+            self._sentence_encoder = sentence_embedder
+        else:
+            log.info(f"Loading sentence encoder via Ollama: {sentence_model_name}")
+            self._sentence_encoder = OllamaEmbedder(
+                model=sentence_model_name,
+                base_url=ollama_base_url,
+                batch_size=batch_size,
+            )
 
         log.success("Reranker ready.")
 
@@ -73,6 +79,10 @@ class Reranker:
         # Use retriever's Ollama URL — the reranker uses it for sentence embedding,
         # which is a retrieval-side concern, not a generator-side concern.
         ollama_url = cfg.retriever.ollama_base_url
+
+        # Share the same embedder instance as the retriever (avoids double model load)
+        sentence_embedder = build_embedder(cfg)
+
         return cls(
             model_name=r.model_name,
             sentence_model_name=r.sentence_model_name,
@@ -82,7 +92,8 @@ class Reranker:
             max_sentences_per_passage=r.max_sentences_per_passage,
             batch_size=r.batch_size,
             sentence_passage_limit=getattr(r, "sentence_passage_limit", 3),
-            title_overlap_boost=getattr(r, "title_overlap_boost", 0.05)
+            title_overlap_boost=getattr(r, "title_overlap_boost", 0.05),
+            sentence_embedder=sentence_embedder,
         )
 
     def rerank(

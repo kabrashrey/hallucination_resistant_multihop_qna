@@ -1,0 +1,133 @@
+# ============================================================
+# HotpotQA Pipeline — vLLM Configuration (CARC)
+# ============================================================
+# Use this config when running on CARC (or any machine with vLLM).
+# It replaces Ollama with two vLLM servers:
+#
+#   Server 1 — Generator  (port 8000):
+#     vllm serve Qwen/Qwen2.5-7B-Instruct \
+#         --host 0.0.0.0 --port 8000 \
+#         --tensor-parallel-size <num_gpus>
+#
+#   Server 2 — Embeddings (port 8001):
+#     vllm serve Qwen/Qwen3-Embedding-8B \
+#         --host 0.0.0.0 --port 8001 \
+#         --task embed \
+#         --tensor-parallel-size 1
+#
+# Then run:
+#   python pipeline/eval.py --config configs/vllm.yaml
+# ============================================================
+
+# --- Data ---
+data:
+  dev_distractor: "data/hotpot_dev_distractor_v1.json"
+  dev_fullwiki: "data/hotpot_dev_fullwiki_v1.json"
+  test_fullwiki: "data/hotpot_test_fullwiki_v1.json"
+  limit: null
+
+# --- Retriever ---
+retriever:
+  # Ollama fallback (unused when use_vllm: true, but kept for reference)
+  embed_model: "qwen3-embedding:8b"
+  ollama_base_url: "http://localhost:11434"
+
+  device: "auto"
+  batch_size: 64          # vLLM handles batching more efficiently — safe to increase
+
+  alpha: 0.7
+  alpha_bridge: 0.6
+  alpha_comparison: 0.5
+  rrf_k: 20
+  candidate_pool_size: 200
+  top_k: 10
+
+  # ── vLLM embeddings ──────────────────────────────────────
+  use_vllm: true
+  vllm_embed_model: "Qwen/Qwen3-Embedding-8B"
+  vllm_embed_base_url: "http://localhost:8001"
+
+  multihop:
+    hops: 2
+    top_k_per_hop: 20
+    max_bridge_entities: 5
+    hop2_strategy: "both"
+    llm_decompose_confidence_threshold: 1.0
+    # Bridge entity extraction also uses the generator server
+    llm_decompose_ollama_model: "Qwen/Qwen2.5-7B-Instruct"
+    extraction_temperature: 0.0
+    extraction_timeout: 300     # vLLM is much faster — lower timeout
+    fuzzy_title_threshold: 70
+
+  index_cache_dir: "index_cache"
+
+# --- Re-Ranker ---
+reranker:
+  model_name: "BAAI/bge-reranker-v2-m3"
+  sentence_model_name: "qwen3-embedding:8b"   # unused when retriever.use_vllm=true
+  device: "auto"
+  top_k: 5
+  sentence_score_threshold: 0.25
+  max_sentences_per_passage: 5
+  sentence_passage_limit: 3
+  title_overlap_boost: 0.05
+  batch_size: 64
+
+# --- Prompt Builder ---
+prompt_builder:
+  include_passage_numbers: true
+  include_sentence_indices: true
+  evidence_first: true
+  max_evidence_chars: 9000
+  bridge_keywords:
+    ["who", "which", "when", "where", "what", "how",
+     "portrayed", "actor", "character", "played"]
+
+  complexity_length_weight: 0.10
+  complexity_length_threshold: 50
+  complexity_keywords_weight: 0.35
+  complexity_confidence_weight: 0.20
+  complexity_sentences_weight: 0.35
+  complexity_sentence_threshold: 5
+  complexity_routing_threshold: 0.50
+
+  temperature_small_model: 0.1
+  temperature_large_model: 0.2
+
+# --- Generator ---
+generator:
+  # Ollama fallback (unused when use_vllm: true)
+  ollama_base_url: "http://localhost:11434"
+  model_small: "gemma4:31b"
+  model_large: "gemma4:31b"
+  request_timeout: 300      # vLLM is much faster
+  validate_citations: true
+  retry_on_parse_failure: true
+  specialist_mode: false
+
+  # ── vLLM generation ──────────────────────────────────────
+  use_vllm: true
+  vllm_base_url: "http://localhost:8000"
+  vllm_model_small: "Qwen/Qwen2.5-7B-Instruct"
+  vllm_model_large: "Qwen/Qwen2.5-7B-Instruct"
+  vllm_max_tokens: 1024
+
+# --- Verifier ---
+verifier:
+  enabled: true
+  retry_on_failure: false
+  max_verification_retries: 1
+  retry_score_threshold: 0.4
+  mode: "overlap"
+  support_threshold: 0.55
+  claim_threshold: 0.45
+  min_supported_claim_ratio: 1.0
+  max_claims: 6
+
+# --- Evaluation ---
+eval:
+  limit: null               # Run full 7,405-example distractor dev set
+  predictions_dir: "results/predictions"
+  metrics_dir: "results/metrics"
+  # vLLM supports concurrent requests — increase workers to saturate the GPU
+  parallel_workers: 8
