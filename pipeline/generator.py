@@ -24,8 +24,8 @@ class Generator:
     def __init__(
         self,
         ollama_base_url: str = "http://localhost:11434",
-        model_small: str = "gemma3:12b",
-        model_large: str = "qwen3:32b",
+        model_small: str = "gemma4:31b",
+        model_large: str = "gemma4:31b",
         request_timeout: int = 1800,
         validate_citations: bool = True,
         retry_on_parse_failure: bool = True,
